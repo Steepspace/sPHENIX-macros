@@ -125,7 +125,7 @@ def get_file_paths(engine, runtype='run3auau'):
     WHERE
         (d.dsttype LIKE 'HIST_CALOQA%' OR d.dsttype LIKE 'HIST_CALOFITTINGQA%')
         AND d.dsttype NOT LIKE 'HIST_CALOQASKIMMED%'
-        AND d.segment != 9999;
+        AND d.segment < 9999;
     """
 
     df = pd.DataFrame()
