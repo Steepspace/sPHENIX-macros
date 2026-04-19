@@ -71,6 +71,8 @@ class PipelineConfig:
     f4a_condor_memory: float
     QVecCalib_condor_memory: float
     n_cores: int
+    charge_threshold: float
+    noise_threshold: float
     verbose: bool
 
     # Helper properties to standardize paths across the script
@@ -82,7 +84,7 @@ class PipelineConfig:
     @property
     def stage_QVecCalib_dir(self) -> Path:
         """Path: Working directory for the multi-pass Q-Vector calibration."""
-        return self.output_dir / "stage-QVecCalib"
+        return self.output_dir / f"stage-QVecCalib-{self.charge_threshold}-{self.noise_threshold}"
 
     @property
     def qa_output_dir(self) -> Path:
@@ -699,7 +701,7 @@ def run_QVecCalib_stage(config: PipelineConfig) -> None:
 
         QVecCalib_condor = textwrap.dedent(f"""\
             executable     = {condor_script}
-            arguments      = {config.f4a_QVecCalib} $(input_dir) $(input_QA) $(input_calib) {idx} {config.dst_tag} {output}
+            arguments      = {config.f4a_QVecCalib} $(input_dir) $(input_QA) $(input_calib) {idx} {config.charge_threshold} {config.noise_threshold} {config.dst_tag} {output}
             log            = {config.condor_log_dir}/job-$(ClusterId)-$(Process).log
             output         = stdout/job-$(ClusterId)-$(Process).out
             error          = error/job-$(ClusterId)-$(Process).err
@@ -741,16 +743,18 @@ def main():
     opt_grp.add_argument("-i2", "--f4a-macro", type=str, default="macros/Fun4All_sEPD.C")
     opt_grp.add_argument("-i3", "--f4a-QVecCalib", type=str, default="macros/Fun4All_QVecCalib.C")
     opt_grp.add_argument("-i4", "--dst-list-dir", type=str, default="")
-    opt_grp.add_argument("-n1", "--segments", type=int, default=15)
+    opt_grp.add_argument("-n1", "--segments", type=int, default=50)
     opt_grp.add_argument("-n2", "--events", type=int, default=0)
     opt_grp.add_argument("-n3", "--n-cores", type=int, default=8)
     opt_grp.add_argument("-t1", "--dst-tag", type=str, default="new_newcdbtag_v008")
     opt_grp.add_argument("-t2", "--cdb-tag", type=str, default="newcdbtag")
+    opt_grp.add_argument("-c1", "--charge-threshold", type=float, default=50)
+    opt_grp.add_argument("-c2", "--noise-threshold", type=float, default=0.5)
     opt_grp.add_argument("-e1", "--f4a-script", type=str, default="scripts/genFun4All.sh")
     opt_grp.add_argument("-e2", "--QVecCalib-script", type=str, default="scripts/genQVecCalib.sh")
     opt_grp.add_argument("-o", "--output", type=str, default="test")
     opt_grp.add_argument("-m1", "--f4a-memory", type=float, default=3)
-    opt_grp.add_argument("-m2", "--QVecCalib-memory", type=float, default=0.5)
+    opt_grp.add_argument("-m2", "--QVecCalib-memory", type=float, default=3)
     opt_grp.add_argument("-l", "--condor-log-dir", type=str, default="")
     opt_grp.add_argument("-v", "--verbose", action="store_true")
 
@@ -785,6 +789,8 @@ def main():
         condor_log_dir=condor_log_dir,
         dst_tag=args.dst_tag,
         cdb_tag=args.cdb_tag,
+        charge_threshold=args.charge_threshold,
+        noise_threshold=args.noise_threshold,
         segments=args.segments,
         events=args.events,
         n_cores=args.n_cores,
