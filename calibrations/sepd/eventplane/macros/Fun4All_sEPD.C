@@ -52,7 +52,6 @@ void Fun4All_sEPD(int nEvents = 0,
   std::cout << "########################" << std::endl;
 
   Fun4AllServer* se = Fun4AllServer::instance();
-  se->Verbosity(10);
 
   std::ifstream infile_stream;
   infile_stream.open(flist, std::ios_base::in);

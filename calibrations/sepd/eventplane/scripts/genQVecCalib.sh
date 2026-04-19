@@ -10,8 +10,10 @@ input=${2}
 QAhist=${3}
 QVecCalibHist=${4}
 pass=${5}
-dst_tag=${6}
-submitDir=${7}
+charge_threshold=${6}
+noise_threshold=${7}
+dst_tag=${8}
+submitDir=${9}
 
 # extract runnumber from file name
 run=$(echo "$input" | grep -oP 'output/\K\d+(?=/tree)')
@@ -47,7 +49,7 @@ if [ "$pass" -eq 2 ]; then
     mkdir -p "output/CDB/$run"
 fi
 
-root -b -l -q "$f4a_macro(\"input.list\", \"$QAhist_file\", \"$QVecCalibHist_file\", $pass, 0, \"output/hist/QVecCalib-$run.root\", \"$dst_tag\", \"output/CDB/$run\")"
+root -b -l -q "$f4a_macro(\"input.list\", \"$QAhist_file\", \"$QVecCalibHist_file\", $pass, 0, \"output/hist/QVecCalib-$run.root\", \"$dst_tag\", $charge_threshold, $noise_threshold, \"output/CDB/$run\")"
 
 echo "All Done and Transferring Files Back"
 cp -rv output/* "$submitDir"
