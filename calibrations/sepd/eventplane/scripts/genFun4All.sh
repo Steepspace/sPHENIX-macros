@@ -25,9 +25,11 @@ fi
 if [[ -n "$_CONDOR_SCRATCH_DIR" && -d "$_CONDOR_SCRATCH_DIR" ]]
 then
     cd "$_CONDOR_SCRATCH_DIR" || { echo "Failed to cd to $_CONDOR_SCRATCH_DIR" >&2; exit 1; }
-    getinputfiles.pl --filelist "$input"
+    cut -d ',' -f 1 "$input" > dst_calofit.list
+    cut -d ',' -f 2 "$input" > dst_zdc.list
+    getinputfiles.pl --filelist dst_calofit.list
+    getinputfiles.pl --filelist dst_zdc.list
     ls -lah
-    ls DST*.root > test.list
 else
     echo "condor scratch NOT set" >&2
     exit 1
@@ -38,7 +40,7 @@ printenv
 
 mkdir -p "$run/hist" "$run/tree"
 
-root -b -l -q "$f4a_macro($nEvents, \"test.list\", \"$run/hist/$output\", \"$run/tree/$output_tree\", \"$dbtag\")"
+root -b -l -q "$f4a_macro($nEvents, \"dst_calofit.list\", \"dst_zdc.list\", \"$run/hist/$output\", \"$run/tree/$output_tree\", \"$dbtag\")"
 
 echo "All Done and Transferring Files Back"
 cp -rv "$run" "$submitDir"

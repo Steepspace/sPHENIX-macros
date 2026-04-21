@@ -4,6 +4,7 @@
 
 #include <epd/EpdReco.h>
 
+#include <caloreco/CaloTowerBuilder.h> // for ZDC
 #include <zdcinfo/ZdcReco.h>
 
 #include <globalvertex/GlobalVertexReco.h>
@@ -37,14 +38,16 @@
 R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
 
 void Fun4All_sEPD(int nEvents = 0,
-                  const std::string& flist = "files.list",
+                  const std::string& flist_calofit="DST_CALOFITTING.list",
+                  const std::string& flist_zdc="DST_ZDC_RAW.list",
                   const std::string& output = "test.root",
                   const std::string& output_tree = "tree.root",
                   const std::string& dbtag = "newcdbtag")
 {
   std::cout << "########################" << std::endl;
   std::cout << "Run Parameters" << std::endl;
-  std::cout << "input list: " << flist << std::endl;
+  std::cout << "input calofit: " << flist_calofit << std::endl;
+  std::cout << "input zdc: " << flist_zdc << std::endl;
   std::cout << "output: " << output << std::endl;
   std::cout << "output tree: " << output_tree << std::endl;
   std::cout << "nEvents: " << nEvents << std::endl;
@@ -54,7 +57,7 @@ void Fun4All_sEPD(int nEvents = 0,
   Fun4AllServer* se = Fun4AllServer::instance();
 
   std::ifstream infile_stream;
-  infile_stream.open(flist, std::ios_base::in);
+  infile_stream.open(flist_calofit, std::ios_base::in);
   std::string filepath;
   getline(infile_stream, filepath);
   std::pair<int, int> runseg = Fun4AllUtils::GetRunSegment(filepath);
@@ -78,6 +81,16 @@ void Fun4All_sEPD(int nEvents = 0,
   // sEPD Reconstruction--Calib Info
   SubsysReco* epdreco = new EpdReco();
   se->registerSubsystem(epdreco);
+
+  // build ZDC towers
+  CaloTowerBuilder *caZDC = new CaloTowerBuilder("ZDCBUILDER");
+  caZDC->set_detector_type(CaloTowerDefs::ZDC);
+  caZDC->set_builder_type(CaloTowerDefs::kPRDFTowerv4);
+  caZDC->set_processing_type(CaloWaveformProcessing::FUNCFIT);
+  caZDC->set_funcfit_type(2);
+  caZDC->set_nsamples(16);
+  caZDC->set_offlineflag();
+  se->registerSubsystem(caZDC);
 
   // ZDC Reconstruction--Calib Info
   ZdcReco* zdcreco = new ZdcReco();
@@ -103,9 +116,13 @@ void Fun4All_sEPD(int nEvents = 0,
   sepd_gen->Verbosity(1);
   se->registerSubsystem(sepd_gen);
 
-  Fun4AllInputManager* In = new Fun4AllDstInputManager("in");
-  In->AddListFile(flist);
+  Fun4AllInputManager* In = new Fun4AllDstInputManager("calofitting");
+  In->AddListFile(flist_calofit);
   se->registerInputManager(In);
+
+  Fun4AllInputManager* In2 = new Fun4AllDstInputManager("zdc");
+  In2->AddListFile(flist_zdc);
+  se->registerInputManager(In2);
 
   Fun4AllOutputManager* out = new Fun4AllDstOutputManager("dstout", output_tree);
   out->SplitLevel(99); // so we can look at its content from the root prompt

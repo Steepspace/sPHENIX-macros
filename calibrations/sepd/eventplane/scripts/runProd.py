@@ -285,7 +285,7 @@ def gen_dst_list(config: PipelineConfig, working_dir: Path) -> None:
         run_list_missing = config.output_dir / "runs.list"
         run_list_missing.write_text("\n".join(missing_runs) + "\n")
 
-        command = ["CreateDstList.pl", "--tag", config.dst_tag, "--list", str(run_list_missing), "DST_CALOFITTING"]
+        command = ["CreateDstList.pl", "--tag", config.dst_tag, "--list", str(run_list_missing), "DST_CALOFITTING", "DST_ZDC_RAW"]
         run_command_and_log(command, config.dst_list_dir)
     else:
         logger.info("All runs have DST Lists.")
@@ -746,7 +746,7 @@ def main():
     opt_grp.add_argument("-n1", "--segments", type=int, default=50)
     opt_grp.add_argument("-n2", "--events", type=int, default=0)
     opt_grp.add_argument("-n3", "--n-cores", type=int, default=8)
-    opt_grp.add_argument("-t1", "--dst-tag", type=str, default="new_newcdbtag_v008")
+    opt_grp.add_argument("-t1", "--dst-tag", type=str, default="pro001_pcdb001_v001")
     opt_grp.add_argument("-t2", "--cdb-tag", type=str, default="newcdbtag")
     opt_grp.add_argument("-c1", "--charge-threshold", type=float, default=50)
     opt_grp.add_argument("-c2", "--noise-threshold", type=float, default=0.5)
