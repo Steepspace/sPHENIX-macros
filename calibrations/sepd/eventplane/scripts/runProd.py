@@ -498,7 +498,7 @@ def monitor_condor_logs(log_dir: Path, total_jobs: int) -> None:
     success_pattern = re.compile(r"Normal termination \(return value 0\)")
     failure_pattern = re.compile(r"Abnormal termination")
     start_time = time.time()
-    max_wait_sec = 2 * 60 * 60  # 2 hours
+    max_wait_sec = 4 * 60 * 60  # 4 hours
 
     # Track which jobs (files) have finished to avoid re-reading them constantly
     finished_files = set()
