@@ -27,8 +27,8 @@ then
     cd "$_CONDOR_SCRATCH_DIR" || { echo "Failed to cd to $_CONDOR_SCRATCH_DIR" >&2; exit 1; }
     cut -d ',' -f 1 "$input" > dst_calofit.list
     cut -d ',' -f 2 "$input" > dst_zdc.list
-    getinputfiles.pl --filelist dst_calofit.list
-    getinputfiles.pl --filelist dst_zdc.list
+    getinputfiles.pl --verbose --filelist dst_calofit.list
+    getinputfiles.pl --verbose --filelist dst_zdc.list
     ls -lah
 else
     echo "condor scratch NOT set" >&2
