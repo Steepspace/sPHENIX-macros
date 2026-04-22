@@ -612,7 +612,7 @@ def run_qa_stage(config: PipelineConfig) -> None:
     gen_dst_list(config, config.stage_qa_dir)
 
     # Copy macro and script to run dir
-    shutil.copy(config.f4a_macro, config.stage_qa_dir)
+    config.f4a_macro = shutil.copy(config.f4a_macro, config.stage_qa_dir)
     shutil.copy(config.f4a_script, config.stage_qa_dir)
 
     # 3. Create Submit File
