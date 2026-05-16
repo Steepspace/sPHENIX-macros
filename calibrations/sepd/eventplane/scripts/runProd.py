@@ -753,8 +753,8 @@ def main():
     opt_grp.add_argument("-e1", "--f4a-script", type=str, default="scripts/genFun4All.sh")
     opt_grp.add_argument("-e2", "--QVecCalib-script", type=str, default="scripts/genQVecCalib.sh")
     opt_grp.add_argument("-o", "--output", type=str, default="test")
-    opt_grp.add_argument("-m1", "--f4a-memory", type=float, default=3)
-    opt_grp.add_argument("-m2", "--QVecCalib-memory", type=float, default=3)
+    opt_grp.add_argument("-m1", "--f4a-memory", type=float, default=1)
+    opt_grp.add_argument("-m2", "--QVecCalib-memory", type=float, default=0.5)
     opt_grp.add_argument("-l", "--condor-log-dir", type=str, default="")
     opt_grp.add_argument("-v", "--verbose", action="store_true")
 
