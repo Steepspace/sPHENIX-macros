@@ -4,9 +4,6 @@
 
 #include <epd/EpdReco.h>
 
-#include <caloreco/CaloTowerBuilder.h> // for ZDC
-#include <zdcinfo/ZdcReco.h>
-
 #include <globalvertex/GlobalVertexReco.h>
 
 #include <centrality/CentralityReco.h>
@@ -39,7 +36,7 @@ R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
 
 void Fun4All_sEPD(int nEvents = 0,
                   const std::string& flist_calofit="DST_CALOFITTING.list",
-                  const std::string& flist_zdc="DST_ZDC_RAW.list",
+                  const std::string& flist_zdc="DST_ZDC.list",
                   const std::string& output = "test.root",
                   const std::string& output_tree = "tree.root",
                   const std::string& dbtag = "newcdbtag")
@@ -81,22 +78,6 @@ void Fun4All_sEPD(int nEvents = 0,
   // sEPD Reconstruction--Calib Info
   SubsysReco* epdreco = new EpdReco();
   se->registerSubsystem(epdreco);
-
-  // build ZDC towers
-  CaloTowerBuilder *caZDC = new CaloTowerBuilder("ZDCBUILDER");
-  caZDC->set_detector_type(CaloTowerDefs::ZDC);
-  caZDC->set_builder_type(CaloTowerDefs::kPRDFTowerv4);
-  caZDC->set_processing_type(CaloWaveformProcessing::FUNCFIT);
-  caZDC->set_funcfit_type(2);
-  caZDC->set_nsamples(16);
-  caZDC->set_offlineflag();
-  se->registerSubsystem(caZDC);
-
-  // ZDC Reconstruction--Calib Info
-  ZdcReco* zdcreco = new ZdcReco();
-  zdcreco->set_zdc1_cut(0.0);
-  zdcreco->set_zdc2_cut(0.0);
-  se->registerSubsystem(zdcreco);
 
   // Official vertex storage
   SubsysReco* gvertex = new GlobalVertexReco();
