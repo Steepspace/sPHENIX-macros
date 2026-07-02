@@ -27,7 +27,9 @@ then
     cd "$_CONDOR_SCRATCH_DIR" || { echo "Failed to cd to $_CONDOR_SCRATCH_DIR" >&2; exit 1; }
     cut -d ',' -f 1 "$input" > dst_calofit.list
     cut -d ',' -f 2 "$input" > dst_zdc.list
+    cut -d ',' -f 3 "$input" > dst_sepd.list
     getinputfiles.pl --verbose --filelist dst_calofit.list
+    getinputfiles.pl --verbose --filelist dst_sepd.list
 
     # Create/clear a temporary file for the basenames
     > dst_zdc_local.list
@@ -57,7 +59,7 @@ printenv
 
 mkdir -p "$run/hist" "$run/tree"
 
-root -b -l -q "$f4a_macro($nEvents, \"dst_calofit.list\", \"dst_zdc.list\", \"$run/hist/$output\", \"$run/tree/$output_tree\", \"$dbtag\")"
+root -b -l -q "$f4a_macro($nEvents, \"dst_calofit.list\", \"dst_zdc.list\", \"dst_sepd.list\", \"$run/hist/$output\", \"$run/tree/$output_tree\", \"$dbtag\")"
 
 echo "All Done and Transferring Files Back"
 

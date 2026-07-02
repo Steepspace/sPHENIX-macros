@@ -10,6 +10,9 @@
 
 #include <calotrigger/MinimumBiasClassifier.h>
 
+#include <calostatusskimmer/CaloStatusSkimmer.h>
+#include <caloreco/CaloTowerBuilder.h>
+
 #include <ffamodules/CDBInterface.h>
 #include <ffamodules/FlagHandler.h>
 
@@ -32,11 +35,14 @@
 #include <string>
 
 
+R__LOAD_LIBRARY(libcalo_reco.so)
+R__LOAD_LIBRARY(libCaloStatusSkimmer.so)
 R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
 
 void Fun4All_sEPD(int nEvents = 0,
                   const std::string& flist_calofit="DST_CALOFITTING.list",
                   const std::string& flist_zdc="DST_ZDC.list",
+                  const std::string& flist_sepd="DST_SEPD.list",
                   const std::string& output = "test.root",
                   const std::string& output_tree = "tree.root",
                   const std::string& dbtag = "newcdbtag")
@@ -45,6 +51,7 @@ void Fun4All_sEPD(int nEvents = 0,
   std::cout << "Run Parameters" << std::endl;
   std::cout << "input calofit: " << flist_calofit << std::endl;
   std::cout << "input zdc: " << flist_zdc << std::endl;
+  std::cout << "input sepd: " << flist_sepd << std::endl;
   std::cout << "output: " << output << std::endl;
   std::cout << "output tree: " << output_tree << std::endl;
   std::cout << "nEvents: " << nEvents << std::endl;
@@ -53,13 +60,31 @@ void Fun4All_sEPD(int nEvents = 0,
 
   Fun4AllServer* se = Fun4AllServer::instance();
 
-  std::ifstream infile_stream;
-  infile_stream.open(flist_calofit, std::ios_base::in);
-  std::string filepath;
-  getline(infile_stream, filepath);
-  std::pair<int, int> runseg = Fun4AllUtils::GetRunSegment(filepath);
-  int runnumber = runseg.first;
-  infile_stream.close();
+
+  // Extract runnumber from first file within list
+  int runnumber;
+  bool isFileList = true;
+  // single file
+  if (flist_calofit.ends_with(".root"))
+  {
+    std::pair<int, int> runseg = Fun4AllUtils::GetRunSegment(flist_calofit);
+    runnumber = runseg.first;
+    isFileList = false;
+  }
+  // list of files
+  else
+  {
+    std::ifstream infile_stream(flist_calofit);
+    if (!infile_stream) {
+      std::cout << "Error: Could not open file list " << flist_calofit << std::endl;
+      return;
+    }
+    std::string filepath;
+    getline(infile_stream, filepath);
+    std::pair<int, int> runseg = Fun4AllUtils::GetRunSegment(filepath);
+    runnumber = runseg.first;
+    infile_stream.close();
+  }
 
   recoConsts* rc = recoConsts::instance();
 
@@ -71,9 +96,24 @@ void Fun4All_sEPD(int nEvents = 0,
   SubsysReco* flag = new FlagHandler();
   se->registerSubsystem(flag);
 
+  // Remove incomplete events from event combiner
+  CaloStatusSkimmer* css = new CaloStatusSkimmer("CaloStatusSkimmer");
+  se->registerSubsystem(css);
+
   // MBD Reconstruction
   SubsysReco* mbdreco = new MbdReco();
   se->registerSubsystem(mbdreco);
+
+  CaloTowerDefs::BuilderType buildertype = CaloTowerDefs::kPRDFTowerv4;
+
+  // sEPD Reconstruction--Calib Info: Packets -> TOWERS_SEPD
+  CaloTowerBuilder *caEPD = new CaloTowerBuilder("SEPDBUILDER");
+  caEPD->set_detector_type(CaloTowerDefs::SEPD);
+  caEPD->set_builder_type(buildertype);
+  caEPD->set_processing_type(CaloWaveformProcessing::TEMPLATE);
+  caEPD->set_nsamples(12);
+  caEPD->set_offlineflag();
+  se->registerSubsystem(caEPD);
 
   // sEPD Reconstruction--Calib Info
   SubsysReco* epdreco = new EpdReco();
@@ -98,12 +138,37 @@ void Fun4All_sEPD(int nEvents = 0,
   se->registerSubsystem(sepd_gen);
 
   Fun4AllInputManager* In = new Fun4AllDstInputManager("calofitting");
-  In->AddListFile(flist_calofit);
+  if (isFileList)
+  {
+    In->AddListFile(flist_calofit);
+  }
+  else
+  {
+    In->AddFile(flist_calofit);
+  }
   se->registerInputManager(In);
 
   Fun4AllInputManager* In2 = new Fun4AllDstInputManager("zdc");
-  In2->AddListFile(flist_zdc);
+  if (isFileList)
+  {
+    In2->AddListFile(flist_zdc);
+  }
+  else
+  {
+    In2->AddFile(flist_zdc);
+  }
   se->registerInputManager(In2);
+
+  Fun4AllInputManager* In3 = new Fun4AllDstInputManager("sepd");
+  if (isFileList)
+  {
+    In3->AddListFile(flist_sepd);
+  }
+  else
+  {
+    In3->AddFile(flist_sepd);
+  }
+  se->registerInputManager(In3);
 
   Fun4AllOutputManager* out = new Fun4AllDstOutputManager("dstout", output_tree);
   out->SplitLevel(99); // so we can look at its content from the root prompt
