@@ -9,6 +9,7 @@
 #include <centrality/CentralityReco.h>
 
 #include <calotrigger/MinimumBiasClassifier.h>
+#include <calotrigger/TriggerRunInfoReco.h>
 
 #include <calostatusskimmer/CaloStatusSkimmer.h>
 #include <caloreco/CaloTowerBuilder.h>
@@ -126,6 +127,11 @@ void Fun4All_sEPD(int nEvents = 100,
   // Official vertex storage
   SubsysReco* gvertex = new GlobalVertexReco();
   se->registerSubsystem(gvertex);
+
+  // Trigger Info Reco
+  TriggerRunInfoReco* trig = new TriggerRunInfoReco();
+  trig->Verbosity(1);
+  se->registerSubsystem(trig);
 
   // custom centrality calib
   std::string cent_calib_dir = "/sphenix/user/anarde/sEPD-Study/centrality_calib";
