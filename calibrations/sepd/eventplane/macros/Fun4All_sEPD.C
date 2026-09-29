@@ -39,36 +39,24 @@ R__LOAD_LIBRARY(libcalo_reco.so)
 R__LOAD_LIBRARY(libCaloStatusSkimmer.so)
 R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
 
-void Fun4All_sEPD(int nEvents = 0,
-                  const std::string& flist_calofit="DST_CALOFITTING.list",
-                  const std::string& flist_zdc="DST_ZDC.list",
-                  const std::string& flist_sepd="DST_SEPD.list",
+void Fun4All_sEPD(int nEvents = 100,
+                  const std::string& flist_calofit="DST_CALOFITTING_run3auau_pro001_pcdb001_v001-00068144-00000.root",
+                  const std::string& flist_zdc="/direct/sphenix+tg+tg01/jets/anarde/run3auau/ZDC/68144/DST_ZDC_CALIB_run3auau_pro001_pcdb001_v001-00068144-00000.root",
+                  const std::string& flist_sepd="DST_SEPD_RAW_run3auau_pro001_pcdb001_v001-00068144-00000.root",
                   const std::string& output = "test.root",
                   const std::string& output_tree = "tree.root",
                   const std::string& dbtag = "newcdbtag")
 {
-  std::cout << "########################" << std::endl;
-  std::cout << "Run Parameters" << std::endl;
-  std::cout << "input calofit: " << flist_calofit << std::endl;
-  std::cout << "input zdc: " << flist_zdc << std::endl;
-  std::cout << "input sepd: " << flist_sepd << std::endl;
-  std::cout << "output: " << output << std::endl;
-  std::cout << "output tree: " << output_tree << std::endl;
-  std::cout << "nEvents: " << nEvents << std::endl;
-  std::cout << "dbtag: " << dbtag << std::endl;
-  std::cout << "########################" << std::endl;
-
-  Fun4AllServer* se = Fun4AllServer::instance();
-
-
-  // Extract runnumber from first file within list
-  int runnumber;
+  // Extract runnumber and segment from first file within list
+  int runnumber = 0;
+  int segment = 0;
   bool isFileList = true;
   // single file
   if (flist_calofit.ends_with(".root"))
   {
     std::pair<int, int> runseg = Fun4AllUtils::GetRunSegment(flist_calofit);
     runnumber = runseg.first;
+    segment = runseg.second;
     isFileList = false;
   }
   // list of files
@@ -83,8 +71,24 @@ void Fun4All_sEPD(int nEvents = 0,
     getline(infile_stream, filepath);
     std::pair<int, int> runseg = Fun4AllUtils::GetRunSegment(filepath);
     runnumber = runseg.first;
+    segment = runseg.second;
     infile_stream.close();
   }
+
+  std::cout << "########################" << std::endl;
+  std::cout << "Run Parameters" << std::endl;
+  std::cout << "input calofit: " << flist_calofit << std::endl;
+  std::cout << "input zdc: " << flist_zdc << std::endl;
+  std::cout << "input sepd: " << flist_sepd << std::endl;
+  std::cout << "output: " << output << std::endl;
+  std::cout << "output tree: " << output_tree << std::endl;
+  std::cout << "nEvents: " << nEvents << std::endl;
+  std::cout << "dbtag: " << dbtag << std::endl;
+  std::cout << "########################" << std::endl;
+
+  Fun4AllServer* se = Fun4AllServer::instance();
+  se->Verbosity(Fun4AllBase::VERBOSITY_SOME);
+  se->VerbosityDownscale(1000);
 
   recoConsts* rc = recoConsts::instance();
 
@@ -123,13 +127,25 @@ void Fun4All_sEPD(int nEvents = 0,
   SubsysReco* gvertex = new GlobalVertexReco();
   se->registerSubsystem(gvertex);
 
+  // custom centrality calib
+  std::string cent_calib_dir = "/sphenix/user/anarde/sEPD-Study/centrality_calib";
+  std::string cent_divs = std::format("{}/divs/cdb_centrality_{}.root", cent_calib_dir, runnumber);
+  // DEFAULT use 68144 if needed
+  // std::string cent_scale = std::format("{}/scales/cdb_centrality_scale_68144.root", cent_calib_dir);
+  std::string cent_scale = std::format("{}/scales/cdb_centrality_scale_{}.root", cent_calib_dir, runnumber);
+  std::string cent_vtx = std::format("{}/vertexscales/cdb_centrality_vertex_scale_{}.root", cent_calib_dir, runnumber);
+
   // Minimum Bias Classifier
   MinimumBiasClassifier* mb = new MinimumBiasClassifier();
-  mb->Verbosity(Fun4AllBase::VERBOSITY_QUIET);
+  mb->setOverwriteScale(cent_scale);
+  mb->setOverwriteVtx(cent_vtx);
   se->registerSubsystem(mb);
 
-  // Centrality
+  // Centrality Reco
   CentralityReco* cent = new CentralityReco();
+  cent->setOverwriteDivs(cent_divs);
+  cent->setOverwriteScale(cent_scale);
+  cent->setOverwriteVtx(cent_vtx);
   se->registerSubsystem(cent);
 
   // sEPD Tree Gen
@@ -137,45 +153,30 @@ void Fun4All_sEPD(int nEvents = 0,
   sepd_gen->Verbosity(1);
   se->registerSubsystem(sepd_gen);
 
-  Fun4AllInputManager* In = new Fun4AllDstInputManager("calofitting");
-  if (isFileList)
-  {
-    In->AddListFile(flist_calofit);
-  }
-  else
-  {
-    In->AddFile(flist_calofit);
-  }
-  se->registerInputManager(In);
+  const std::vector<std::pair<std::string, std::string>> input_files = {
+      {"calofitting", flist_calofit},
+      {"zdc", flist_zdc},
+      {"sepd", flist_sepd}};
 
-  Fun4AllInputManager* In2 = new Fun4AllDstInputManager("zdc");
-  if (isFileList)
+  for (const auto& [name, filepath] : input_files)
   {
-    In2->AddListFile(flist_zdc);
+    Fun4AllInputManager* in = new Fun4AllDstInputManager(name);
+    if (isFileList)
+    {
+      in->AddListFile(filepath);
+    }
+    else
+    {
+      in->AddFile(filepath);
+    }
+    se->registerInputManager(in);
   }
-  else
-  {
-    In2->AddFile(flist_zdc);
-  }
-  se->registerInputManager(In2);
-
-  Fun4AllInputManager* In3 = new Fun4AllDstInputManager("sepd");
-  if (isFileList)
-  {
-    In3->AddListFile(flist_sepd);
-  }
-  else
-  {
-    In3->AddFile(flist_sepd);
-  }
-  se->registerInputManager(In3);
 
   Fun4AllOutputManager* out = new Fun4AllDstOutputManager("dstout", output_tree);
   out->SplitLevel(99); // so we can look at its content from the root prompt
   out->AddNode("EventPlaneData");
   se->registerOutputManager(out);
 
-  se->Verbosity(Fun4AllBase::VERBOSITY_QUIET);
   se->run(nEvents);
   se->End();
 
