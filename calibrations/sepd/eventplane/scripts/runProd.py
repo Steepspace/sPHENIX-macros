@@ -60,6 +60,7 @@ class PipelineConfig:
     f4a_script: Path
     QVecCalib_script: Path
     output_dir: Path
+    job_output_dir: Path | None
     dst_list_dir: Path
     condor_log_dir: Path
 
@@ -381,14 +382,20 @@ def generate_QVecCalib_local_jobs_file(input_file: Path, output_file: Path, cali
 
         try:
             run_num = path_obj.parents[0].name
-        except IndexError:
-            # Fallback if path structure is shallower than expected
-            try:
-                idx = path_obj.parts.index("output")
-                run_num = path_obj.parts[idx + 1]
-            except ValueError:
-                logger.warning(f"Skipping malformed path: {path_str}")
-                continue
+            if not run_num or not run_num.isdigit():
+                raise ValueError(f"Parent '{run_num}' is not a valid run number")
+        except (IndexError, ValueError):
+            # Fallback if path structure is shallower or different than expected
+            match = re.search(r"/(\d+)/tree", path_str)
+            if match:
+                run_num = match.group(1)
+            else:
+                try:
+                    idx = path_obj.parts.index("output")
+                    run_num = path_obj.parts[idx + 1]
+                except (ValueError, IndexError):
+                    logger.warning(f"Skipping malformed path: {path_str}")
+                    continue
 
         calib_arg = "none"
         if calib_dir:
@@ -498,7 +505,7 @@ def monitor_condor_logs(log_dir: Path, total_jobs: int) -> None:
     success_pattern = re.compile(r"Normal termination \(return value 0\)")
     failure_pattern = re.compile(r"Abnormal termination")
     start_time = time.time()
-    max_wait_sec = 4 * 60 * 60  # 4 hours
+    max_wait_sec = 48 * 60 * 60  # 48 hours
 
     # Track which jobs (files) have finished to avoid re-reading them constantly
     finished_files = set()
@@ -605,8 +612,21 @@ def run_qa_stage(config: PipelineConfig) -> None:
     # 1. Setup Directories
     config.stage_qa_dir.mkdir(parents=True, exist_ok=True)
 
-    for subdir in ["stdout", "error", "output"]:
+    for subdir in ["stdout", "error"]:
         (config.stage_qa_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    output_symlink = config.stage_qa_dir / "output"
+    if config.job_output_dir:
+        config.job_output_dir.mkdir(parents=True, exist_ok=True)
+        if output_symlink.is_symlink() or output_symlink.is_file():
+            output_symlink.unlink()
+        elif output_symlink.is_dir():
+            shutil.rmtree(output_symlink)
+        output_symlink.symlink_to(config.job_output_dir, target_is_directory=True)
+    else:
+        if output_symlink.is_symlink() or output_symlink.is_file():
+            output_symlink.unlink()
+        output_symlink.mkdir(parents=True, exist_ok=True)
 
     # 2. Generate Inputs
     gen_dst_list(config, config.stage_qa_dir)
@@ -752,7 +772,15 @@ def main():
     opt_grp.add_argument("-c2", "--noise-threshold", type=float, default=0.5)
     opt_grp.add_argument("-e1", "--f4a-script", type=str, default="scripts/genFun4All.sh")
     opt_grp.add_argument("-e2", "--QVecCalib-script", type=str, default="scripts/genQVecCalib.sh")
-    opt_grp.add_argument("-o", "--output", type=str, default="test")
+    opt_grp.add_argument("-o", "--output", type=str, default="test", help="Project Directory. Default: test")
+    opt_grp.add_argument(
+        "-o2",
+        "--job-output-dir",
+        "--job-output",
+        type=str,
+        default=None,
+        help="Alternate Output Directory for job output files. If provided, a symlink will be created in the main output_dir.",
+    )
     opt_grp.add_argument("-m1", "--f4a-memory", type=float, default=1)
     opt_grp.add_argument("-m2", "--QVecCalib-memory", type=float, default=0.5)
     opt_grp.add_argument("-l", "--condor-log-dir", type=str, default="")
@@ -762,6 +790,7 @@ def main():
 
     # Resolve paths immediately
     output_dir = Path(args.output).resolve()
+    job_output_dir = Path(args.job_output_dir).resolve() if args.job_output_dir else None
 
     # Determine defaults for paths that depend on others
     dst_list_dir = Path(args.dst_list_dir).resolve() if args.dst_list_dir else output_dir / "dst-lists"
@@ -785,6 +814,7 @@ def main():
         f4a_script=Path(args.f4a_script).resolve(),
         QVecCalib_script=Path(args.QVecCalib_script).resolve(),
         output_dir=output_dir,
+        job_output_dir=job_output_dir,
         dst_list_dir=dst_list_dir,
         condor_log_dir=condor_log_dir,
         dst_tag=args.dst_tag,
@@ -802,6 +832,17 @@ def main():
     # Create base directories
     config.output_dir.mkdir(parents=True, exist_ok=True)
     config.dst_list_dir.mkdir(parents=True, exist_ok=True)
+
+    main_output_symlink = config.output_dir / "output"
+    if config.job_output_dir:
+        config.job_output_dir.mkdir(parents=True, exist_ok=True)
+        if main_output_symlink.is_symlink() or main_output_symlink.is_file():
+            main_output_symlink.unlink()
+        elif main_output_symlink.is_dir():
+            shutil.rmtree(main_output_symlink)
+        main_output_symlink.symlink_to(config.job_output_dir, target_is_directory=True)
+    elif main_output_symlink.is_symlink():
+        main_output_symlink.unlink()
 
     # Setup Logging
     setup_logging(config.log_file, config.verbose)
