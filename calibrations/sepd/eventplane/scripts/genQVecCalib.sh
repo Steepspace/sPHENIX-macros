@@ -16,8 +16,11 @@ dst_tag=${8}
 submitDir=${9}
 
 # extract runnumber from file name
-run=$(echo "$input" | grep -oP 'output/\K\d+(?=/tree)')
+run=$(echo "$input" | grep -oP '(?<=/)\d+(?=/tree)')
 if [[ -z "$run" ]]; then
+    run=$(basename "$(dirname "$input")")
+fi
+if [[ -z "$run" || ! "$run" =~ ^[0-9]+$ ]]; then
     echo "Failed to parse run number from input: $input" >&2
     exit 1
 fi
