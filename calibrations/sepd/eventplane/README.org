@@ -54,6 +54,7 @@ python3 runProd.py -i runs.list --output /path/to/output --cdb-tag my_tag
 
 *** Data & Path Configuration
 - -o, --output: Base directory for all stage outputs, logs, and final results. Defaults to ~test~.
+- -o2, --job-output-dir: Alternate output directory for job output files. If provided, symlinks will be created in the main output directory and Stage-QA directory.
 - -i4, --dst-list-dir: Directory containing existing DST lists. If not provided, it defaults to a ~dst-lists~ folder within the output directory.
 - -l, --condor-log-dir: Directory where HTCondor will write .log files. If empty, it defaults to ~/tmp/[USER]/dump~.
 
