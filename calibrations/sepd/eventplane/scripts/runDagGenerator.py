@@ -14,7 +14,7 @@ Key Architecture:
    for slower runs.
 
 2. Simple Input Handling (Direct Input DST List):
-   Like Jet-Vn/condor_utils, simply pass -i / --input-list pointing directly to a DST list
+   Simply pass -i / --input-list pointing directly to a DST list
    or a text file containing a list of DST list paths. No CreateDstList.pl or complex
    directory synchronization required.
 
@@ -22,7 +22,7 @@ Key Architecture:
    HTCondor submit daemons (schedds) enforce a MAX_JOBS_RUNNING = 15,000 limit.
    When processing large datasets across many runs, this script can query 'condor_status -submitters',
    rank available submit nodes (sphnxuser01..08) by available headroom, and partition
-   the runs across multiple submit nodes (using the same pattern as Jet-Vn/condor_utils).
+   the runs across multiple submit nodes.
 
 4. Automatic Recovery & Concurrency Control:
    - Transient GPFS/network errors are automatically retried via RETRY directives.
@@ -34,6 +34,7 @@ Date: 2026
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
 import os
@@ -83,6 +84,7 @@ class PipelineConfig:
     split_nodes: int
     submit_nodes: list[str]
     ranking_user: str
+    threads: int
     verbose: bool
 
     @property
@@ -320,19 +322,20 @@ def prepare_dst_lists(config: PipelineConfig) -> dict[str, list[Path]]:
                 continue
             dst_list_paths.append(p)
 
-    run_segments: dict[str, list[Path]] = {}
-
-    for dst_file in dst_list_paths:
+    def _process_single_dst(dst_file: Path) -> tuple[str, list[Path]] | None:
         run = extract_run_number(dst_file.name)
         if not run or run == "0":
             # Fallback: check first line of file
-            first_lines = dst_file.read_text().splitlines()
-            if first_lines:
-                run = extract_run_number(first_lines[0])
+            try:
+                first_lines = dst_file.read_text().splitlines()
+                if first_lines:
+                    run = extract_run_number(first_lines[0])
+            except Exception:
+                pass
 
         if not run or run == "0":
             logger.warning(f"Could not parse run number from {dst_file}. Skipping.")
-            continue
+            return None
 
         stem = dst_file.stem
         try:
@@ -341,15 +344,40 @@ def prepare_dst_lists(config: PipelineConfig) -> dict[str, list[Path]]:
                 lines = lines[:config.segments]
         except Exception as e:
             logger.error(f"Failed to read {dst_file}: {e}")
-            continue
+            return None
 
-        run_segments[run] = []
+        seg_paths = []
         for i, line_str in enumerate(lines):
             seg_file = files_dir / f"{stem}-{i:03d}.list"
             seg_file.write_text(line_str + "\n")
-            run_segments[run].append(seg_file)
+            seg_paths.append(seg_file)
 
-        logger.info(f"Run {run} ({dst_file.name}): split into {len(run_segments[run])} segment(s).")
+        logger.debug(f"Run {run} ({dst_file.name}): split into {len(seg_paths)} segment(s).")
+        return run, seg_paths
+
+    num_workers = max(1, config.threads)
+    run_segments: dict[str, list[Path]] = {}
+
+    if len(dst_list_paths) <= 2 or num_workers <= 1:
+        for p in dst_list_paths:
+            res = _process_single_dst(p)
+            if res:
+                run, segs = res
+                if run in run_segments:
+                    run_segments[run].extend(segs)
+                else:
+                    run_segments[run] = segs
+    else:
+        logger.info(f"Splitting DSTs across {len(dst_list_paths)} runs using {num_workers} parallel workers...")
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = executor.map(_process_single_dst, dst_list_paths)
+            for res in results:
+                if res:
+                    run, segs = res
+                    if run in run_segments:
+                        run_segments[run].extend(segs)
+                    else:
+                        run_segments[run] = segs
 
     return run_segments
 
@@ -454,7 +482,6 @@ def compute_retry_memory(
     Computes a comma-separated retry_request_memory string for HTCondor.
     If explicit_val is provided, returns that directly.
     Otherwise, steps memory from (base_memory + step) up to ceiling in increments of step.
-    Matches the behavior of Jet-Vn/condor_utils/core/manager.py.
     """
     if explicit_val:
         return explicit_val
@@ -496,7 +523,7 @@ def write_condor_submit_templates(
         config.retry_request_memory,
     )
     retry_mem_hadd = compute_retry_memory(
-        2.0,
+        0.5,
         config.retry_memory_step,
         config.retry_memory_max,
         config.retry_request_memory,
@@ -551,7 +578,7 @@ def write_condor_submit_templates(
         log=f"{config.condor_log_dir}/hadd-$(run).log",
         output=f"{config.stage_qa_dir}/stdout/hadd-$(run).out",
         error=f"{config.stage_qa_dir}/error/hadd-$(run).err",
-        request_mem="2GB",
+        request_mem="0.5GB",
         retry_mem=retry_mem_hadd,
     )
     (config.submit_dir / "hadd.sub").write_text(hadd_sub)
@@ -588,7 +615,9 @@ def generate_dags(
     dagman_config = config.dag_dir / "dagman.config"
     dagman_config.write_text(textwrap.dedent("""\
         DAGMAN_MAX_JOBS_SUBMITTED = 0
-        DAGMAN_MAX_JOBS_IDLE = 0
+        DAGMAN_MAX_JOBS_IDLE = 15000
+        DAGMAN_MAX_SUBMITS_PER_INTERVAL = 1000
+        DAGMAN_AGGRESSIVE_SUBMIT = True
         DAGMAN_SUBMIT_DELAY = 0
         DAGMAN_USE_STRICT = 0
     """))
@@ -604,7 +633,7 @@ def generate_dags(
     active_runs = [r for r, segs in run_segments.items() if segs]
 
     # Generate individual run DAGs
-    for run in active_runs:
+    def _write_single_run_dag(run: str) -> None:
         seg_files = run_segments[run]
         run_dag_path = config.dag_runs_dir / f"run_{run}.dag"
         dag_lines = [
@@ -687,6 +716,15 @@ def generate_dags(
 
         run_dag_path.write_text("\n".join(dag_lines) + "\n")
 
+    num_workers = max(1, config.threads)
+    if len(active_runs) <= 2 or num_workers <= 1:
+        for run in active_runs:
+            _write_single_run_dag(run)
+    else:
+        logger.info(f"Writing {len(active_runs)} per-run DAGs using {num_workers} parallel workers...")
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            list(executor.map(_write_single_run_dag, active_runs))
+
     # Generate Partitioned Master DAGs
     node_dags: dict[str, Path] = {}
     node_run_map: dict[str, list[str]] = {node: [] for node in target_nodes}
@@ -742,7 +780,7 @@ def generate_dags(
     if len(target_nodes) > 1:
         dags_to_prepare.append(config.dag_dir / "master.dag")
 
-    for dag_p in dags_to_prepare:
+    def _prepare_single_master_dag(dag_p: Path) -> None:
         sub_file = dag_p.with_name(f"{dag_p.name}.condor.sub")
         try:
             subprocess.run(
@@ -762,6 +800,13 @@ def generate_dags(
                 sub_file.write_text(content)
         except Exception as e:
             logger.warning(f"Could not pre-generate {sub_file.name}: {e}")
+
+    if len(dags_to_prepare) > 1 and num_workers > 1:
+        with ThreadPoolExecutor(max_workers=min(len(dags_to_prepare), num_workers)) as executor:
+            list(executor.map(_prepare_single_master_dag, dags_to_prepare))
+    else:
+        for dag_p in dags_to_prepare:
+            _prepare_single_master_dag(dag_p)
 
     return node_dags
 
@@ -803,6 +848,7 @@ def main():
     res_grp.add_argument("--retry-request-memory", type=str, default=None, help='Explicit retry_request_memory setting (e.g. "1.5GB, 2.0GB, 4.0GB"). If None, stepped automatically from base memory + retry_memory_step up to retry_memory_max.')
     res_grp.add_argument("-l", "--condor-log-dir", type=str, default="")
     res_grp.add_argument("--max-qa-jobs", type=int, default=0, help="Maximum concurrent QA jobs in DAG (0 = unconstrained up to schedd limits).")
+    res_grp.add_argument("-j", "--threads", "--jobs", type=int, default=16, help="Parallel worker threads for file splitting and DAG generation (default: 16).")
     res_grp.add_argument("--split-nodes", type=int, default=1, help="Distribute runs across N best submit nodes (1 to 8) to avoid the 15k job schedd cap.")
     res_grp.add_argument("--submit-nodes", type=str, default="", help="Explicit comma-separated list of submit nodes (e.g. sphnxuser01,sphnxuser02).")
     res_grp.add_argument("--user", type=str, default="", help="Username for submit node ranking (default: current $USER).")
@@ -849,6 +895,7 @@ def main():
         split_nodes=args.split_nodes,
         submit_nodes=[],
         ranking_user=ranking_user,
+        threads=args.threads,
         verbose=args.verbose,
     )
 
