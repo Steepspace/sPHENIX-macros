@@ -35,6 +35,7 @@ Date: 2026
 
 import argparse
 import logging
+import math
 import os
 import re
 import shutil
@@ -72,6 +73,10 @@ class PipelineConfig:
     events: int
     f4a_condor_memory: float
     QVecCalib_condor_memory: float
+    max_retries: int
+    retry_memory_step: float
+    retry_memory_max: float
+    retry_request_memory: str | None
     charge_threshold: float
     noise_threshold: float
     max_qa_jobs: int
@@ -91,6 +96,10 @@ class PipelineConfig:
     @property
     def dag_dir(self) -> Path:
         return self.output_dir / "dag"
+
+    @property
+    def dag_runs_dir(self) -> Path:
+        return self.dag_dir / "runs"
 
     @property
     def submit_dir(self) -> Path:
@@ -421,43 +430,143 @@ def write_helper_scripts(config: PipelineConfig) -> tuple[Path, Path]:
     return hadd_sh, finalize_sh
 
 
+def format_memory(mem: float | int | str) -> str:
+    """Formats numeric memory value to HTCondor memory string (e.g. 1.0 -> '1GB', 0.5 -> '0.5GB')."""
+    if isinstance(mem, (int, float)):
+        f = float(mem)
+        return f"{int(f)}GB" if f.is_integer() else f"{f:g}GB"
+    s = str(mem).strip()
+    m = re.match(r"^([\d\.]+)\s*([a-zA-Z]*)$", s)
+    if m:
+        f = float(m.group(1))
+        unit = m.group(2) or "GB"
+        return f"{int(f)}{unit}" if f.is_integer() else f"{f:g}{unit}"
+    return s
+
+
+def compute_retry_memory(
+    base_memory: float | int | str,
+    step: float,
+    ceiling: float,
+    explicit_val: str | None = None,
+) -> str | None:
+    """
+    Computes a comma-separated retry_request_memory string for HTCondor.
+    If explicit_val is provided, returns that directly.
+    Otherwise, steps memory from (base_memory + step) up to ceiling in increments of step.
+    Matches the behavior of Jet-Vn/condor_utils/core/manager.py.
+    """
+    if explicit_val:
+        return explicit_val
+
+    if not step or step <= 0 or not ceiling:
+        return None
+
+    mem_float = None
+    if isinstance(base_memory, (int, float)):
+        mem_float = float(base_memory)
+    else:
+        mem_s = str(base_memory).strip()
+        m = re.match(r"^([\d\.]+)\s*([a-zA-Z]*)$", mem_s)
+        if m:
+            mem_float = float(m.group(1))
+
+    if mem_float is None or ceiling <= mem_float:
+        return None
+
+    steps = []
+    curr = mem_float + float(step)
+    while round(curr, 4) <= round(float(ceiling), 4):
+        val = round(curr, 4)
+        steps.append(f"{int(val)}GB" if val.is_integer() else f"{val:g}GB")
+        curr += float(step)
+
+    return ", ".join(steps) if steps else None
+
+
 def write_condor_submit_templates(
     config: PipelineConfig,
     hadd_sh: Path,
 ) -> None:
     """Generates the generic Condor submit files for QA, Hadd, and Calibration passes."""
+    retry_mem_qa = compute_retry_memory(
+        config.f4a_condor_memory,
+        config.retry_memory_step,
+        config.retry_memory_max,
+        config.retry_request_memory,
+    )
+    retry_mem_hadd = compute_retry_memory(
+        2.0,
+        config.retry_memory_step,
+        config.retry_memory_max,
+        config.retry_request_memory,
+    )
+    retry_mem_calib = compute_retry_memory(
+        config.QVecCalib_condor_memory,
+        config.retry_memory_step,
+        config.retry_memory_max,
+        config.retry_request_memory,
+    )
+
+    def _build_sub_file(
+        executable: Path,
+        arguments: str,
+        log: str,
+        output: str,
+        error: str,
+        request_mem: str,
+        retry_mem: str | None,
+    ) -> str:
+        lines = [
+            f"executable           = {executable}",
+            f"arguments            = {arguments}",
+            f"log                  = {log}",
+            f"output               = {output}",
+            f"error                = {error}",
+            f"request_memory       = {request_mem}",
+        ]
+        if retry_mem:
+            lines.append(f"retry_request_memory = {retry_mem}")
+        if config.max_retries > 0:
+            lines.append(f"max_retries          = {config.max_retries}")
+        lines.append("queue\n")
+        return "\n".join(lines)
+
     # 1. qa.sub
-    (config.submit_dir / "qa.sub").write_text(textwrap.dedent(f"""\
-        executable     = {config.f4a_script}
-        arguments      = {config.f4a_macro} $(input_dst) test-$(run)-$(seg).root tree-$(run)-$(seg).root {config.events} {config.cdb_tag} {config.stage_qa_dir}/output
-        log            = {config.condor_log_dir}/qa-$(run)-$(seg).log
-        output         = {config.stage_qa_dir}/stdout/qa-$(run)-$(seg).out
-        error          = {config.stage_qa_dir}/error/qa-$(run)-$(seg).err
-        request_memory = {config.f4a_condor_memory}GB
-        queue
-    """))
+    qa_sub = _build_sub_file(
+        executable=config.f4a_script,
+        arguments=f"{config.f4a_macro} $(input_dst) test-$(run)-$(seg).root tree-$(run)-$(seg).root {config.events} {config.cdb_tag} {config.stage_qa_dir}/output",
+        log=f"{config.condor_log_dir}/qa-$(run)-$(seg).log",
+        output=f"{config.stage_qa_dir}/stdout/qa-$(run)-$(seg).out",
+        error=f"{config.stage_qa_dir}/error/qa-$(run)-$(seg).err",
+        request_mem=format_memory(config.f4a_condor_memory),
+        retry_mem=retry_mem_qa,
+    )
+    (config.submit_dir / "qa.sub").write_text(qa_sub)
 
     # 2. hadd.sub
-    (config.submit_dir / "hadd.sub").write_text(textwrap.dedent(f"""\
-        executable     = {hadd_sh}
-        arguments      = $(output_qa) $(input_hist_dir)
-        log            = {config.condor_log_dir}/hadd-$(run).log
-        output         = {config.stage_qa_dir}/stdout/hadd-$(run).out
-        error          = {config.stage_qa_dir}/error/hadd-$(run).err
-        request_memory = 2GB
-        queue
-    """))
+    hadd_sub = _build_sub_file(
+        executable=hadd_sh,
+        arguments="$(output_qa) $(input_hist_dir)",
+        log=f"{config.condor_log_dir}/hadd-$(run).log",
+        output=f"{config.stage_qa_dir}/stdout/hadd-$(run).out",
+        error=f"{config.stage_qa_dir}/error/hadd-$(run).err",
+        request_mem="2GB",
+        retry_mem=retry_mem_hadd,
+    )
+    (config.submit_dir / "hadd.sub").write_text(hadd_sub)
 
     # 3. calib.sub (Shared for Pass 0, 1, 2)
-    (config.submit_dir / "calib.sub").write_text(textwrap.dedent(f"""\
-        executable     = {config.QVecCalib_script}
-        arguments      = {config.f4a_QVecCalib} $(tree_dir) $(qa_hist) $(calib_hist) $(pass_num) {config.charge_threshold} {config.noise_threshold} {config.dst_tag} $(pass_out_dir)
-        log            = {config.condor_log_dir}/calib-$(run)-p$(pass_num).log
-        output         = $(calib_type_dir)/stdout/calib-$(run)-p$(pass_num).out
-        error          = $(calib_type_dir)/error/calib-$(run)-p$(pass_num).err
-        request_memory = {config.QVecCalib_condor_memory}GB
-        queue
-    """))
+    calib_sub = _build_sub_file(
+        executable=config.QVecCalib_script,
+        arguments=f"{config.f4a_QVecCalib} $(tree_dir) $(qa_hist) $(calib_hist) $(pass_num) {config.charge_threshold} {config.noise_threshold} {config.dst_tag} $(pass_out_dir)",
+        log=f"{config.condor_log_dir}/calib-$(run)-p$(pass_num).log",
+        output="$(calib_type_dir)/stdout/calib-$(run)-p$(pass_num).out",
+        error="$(calib_type_dir)/error/calib-$(run)-p$(pass_num).err",
+        request_mem=format_memory(config.QVecCalib_condor_memory),
+        retry_mem=retry_mem_calib,
+    )
+    (config.submit_dir / "calib.sub").write_text(calib_sub)
 
 
 # -----------------------------------------------------------------------------
@@ -479,8 +588,9 @@ def generate_dags(
     dagman_config = config.dag_dir / "dagman.config"
     dagman_config.write_text(textwrap.dedent("""\
         DAGMAN_MAX_JOBS_SUBMITTED = 0
-        DAGMAN_MAX_JOBS_IDLE = 5000
+        DAGMAN_MAX_JOBS_IDLE = 0
         DAGMAN_SUBMIT_DELAY = 0
+        DAGMAN_USE_STRICT = 0
     """))
 
     pass0_dir = config.stage_calib_dir / "ComputeRecentering"
@@ -496,7 +606,7 @@ def generate_dags(
     # Generate individual run DAGs
     for run in active_runs:
         seg_files = run_segments[run]
-        run_dag_path = config.dag_dir / f"run_{run}.dag"
+        run_dag_path = config.dag_runs_dir / f"run_{run}.dag"
         dag_lines = [
             f"# =====================================================================",
             f"# Workflow for Run {run} ({len(seg_files)} segments)",
@@ -511,24 +621,26 @@ def generate_dags(
             node_name = f"QA_{seg_str}"
             qa_node_names.append(node_name)
 
-            dag_lines.append(f'JOB {node_name} ../submit/qa.sub')
+            dag_lines.append(f'JOB {node_name} {config.submit_dir / "qa.sub"}')
             dag_lines.append(f'VARS {node_name} run="{run}" seg="{seg_str}" input_dst="{seg_file.resolve()}"')
             if config.max_qa_jobs > 0:
                 dag_lines.append(f'CATEGORY {node_name} QA_LIMIT')
-            dag_lines.append(f'RETRY {node_name} 3')
+            if config.max_retries > 0:
+                dag_lines.append(f'RETRY {node_name} {config.max_retries}')
 
-        # --- Stage 2: Hadd Merge ---
+        # --- Stage 2: Parallel QA Histogram Merge ---
         output_qa = config.qa_output_dir / f"QA-{run}.root"
         input_hist_dir = config.stage_qa_dir / "output" / run / "hist"
 
         dag_lines.extend([
             "",
             "# --- Stage 2: Parallel QA Histogram Merge ---",
-            f"JOB HADD ../submit/hadd.sub",
+            f"JOB HADD {config.submit_dir / 'hadd.sub'}",
             f'VARS HADD run="{run}" output_qa="{output_qa}" input_hist_dir="{input_hist_dir}"',
             f'PARENT {" ".join(qa_node_names)} CHILD HADD',
-            f"RETRY HADD 2",
         ])
+        if config.max_retries > 0:
+            dag_lines.append(f"RETRY HADD {config.max_retries}")
 
         # --- Stage 3: Iterative Calibration Passes ---
         tree_dir = config.stage_qa_dir / "output" / run / "tree"
@@ -539,22 +651,34 @@ def generate_dags(
             "",
             "# --- Stage 3: Iterative Calibration Passes ---",
             "# Pass 0: ComputeRecentering",
-            f"JOB PASS_0 ../submit/calib.sub",
+            f"JOB PASS_0 {config.submit_dir / 'calib.sub'}",
             f'VARS PASS_0 run="{run}" pass_num="0" tree_dir="{tree_dir}" qa_hist="{output_qa}" calib_hist="none" pass_out_dir="{pass0_out}" calib_type_dir="{pass0_dir}"',
             f"PARENT HADD CHILD PASS_0",
-            f"RETRY PASS_0 2",
+        ])
+        if config.max_retries > 0:
+            dag_lines.append(f"RETRY PASS_0 {config.max_retries}")
+
+        dag_lines.extend([
             "",
             "# Pass 1: ApplyRecentering",
-            f"JOB PASS_1 ../submit/calib.sub",
+            f"JOB PASS_1 {config.submit_dir / 'calib.sub'}",
             f'VARS PASS_1 run="{run}" pass_num="1" tree_dir="{tree_dir}" qa_hist="{output_qa}" calib_hist="{pass0_calib}" pass_out_dir="{pass1_out}" calib_type_dir="{pass1_dir}"',
             f"PARENT PASS_0 CHILD PASS_1",
-            f"RETRY PASS_1 2",
+        ])
+        if config.max_retries > 0:
+            dag_lines.append(f"RETRY PASS_1 {config.max_retries}")
+
+        dag_lines.extend([
             "",
             "# Pass 2: ApplyFlattening",
-            f"JOB PASS_2 ../submit/calib.sub",
+            f"JOB PASS_2 {config.submit_dir / 'calib.sub'}",
             f'VARS PASS_2 run="{run}" pass_num="2" tree_dir="{tree_dir}" qa_hist="{output_qa}" calib_hist="{pass1_calib}" pass_out_dir="{pass2_out}" calib_type_dir="{pass2_dir}"',
             f"PARENT PASS_1 CHILD PASS_2",
-            f"RETRY PASS_2 2",
+        ])
+        if config.max_retries > 0:
+            dag_lines.append(f"RETRY PASS_2 {config.max_retries}")
+
+        dag_lines.extend([
             "",
             "# Finalize Run Output as soon as Pass 2 completes",
             f"SCRIPT POST PASS_2 {finalize_sh} $RETURN {run} {pass2_out} {config.final_qvec_dir} {config.final_cdb_dir}",
@@ -585,7 +709,7 @@ def generate_dags(
             "",
         ]
         for run in runs:
-            lines.append(f"SPLICE RUN_{run} run_{run}.dag")
+            lines.append(f"SPLICE RUN_{run} runs/run_{run}.dag")
 
         if config.max_qa_jobs > 0:
             lines.extend([
@@ -608,10 +732,36 @@ def generate_dags(
             "",
         ]
         for run in active_runs:
-            all_lines.append(f"SPLICE RUN_{run} run_{run}.dag")
+            all_lines.append(f"SPLICE RUN_{run} runs/run_{run}.dag")
         if config.max_qa_jobs > 0:
             all_lines.extend(["", f"MAXJOBS QA_LIMIT {config.max_qa_jobs}"])
         all_dag_path.write_text("\n".join(all_lines) + "\n")
+
+    # Pre-generate Condor submit file for each master DAG with log directly in the file
+    dags_to_prepare = list(node_dags.values())
+    if len(target_nodes) > 1:
+        dags_to_prepare.append(config.dag_dir / "master.dag")
+
+    for dag_p in dags_to_prepare:
+        sub_file = dag_p.with_name(f"{dag_p.name}.condor.sub")
+        try:
+            subprocess.run(
+                ["condor_submit_dag", "-no_submit", "-f", dag_p.name],
+                cwd=config.dag_dir,
+                capture_output=True,
+                text=True,
+            )
+            if sub_file.exists():
+                content = sub_file.read_text()
+                content = re.sub(
+                    r"^log\s*=.*$",
+                    f"log         = {config.condor_log_dir}/{dag_p.name}.dagman.log",
+                    content,
+                    flags=re.MULTILINE,
+                )
+                sub_file.write_text(content)
+        except Exception as e:
+            logger.warning(f"Could not pre-generate {sub_file.name}: {e}")
 
     return node_dags
 
@@ -647,6 +797,10 @@ def main():
     res_grp = parser.add_argument_group("Condor Resources & Load Balancing")
     res_grp.add_argument("-m1", "--f4a-memory", type=float, default=1.0, help="Memory for QA jobs in GB.")
     res_grp.add_argument("-m2", "--calib-memory", "--QVecCalib-memory", type=float, default=0.5, help="Memory for calib jobs in GB.")
+    res_grp.add_argument("-m", "--max-retries", type=int, default=3, help="Max Condor job retries on failure / eviction. Default: 3.")
+    res_grp.add_argument("--retry-memory-step", type=float, default=0.5, help="Memory in GB to add each time job is evicted for exceeding memory. Default: 0.5 GB. Set to 0 to disable.")
+    res_grp.add_argument("--retry-memory-max", type=float, default=6.0, help="Ceiling / max memory in GB for automatic memory retries. Default: 6.0 GB.")
+    res_grp.add_argument("--retry-request-memory", type=str, default=None, help='Explicit retry_request_memory setting (e.g. "1.5GB, 2.0GB, 4.0GB"). If None, stepped automatically from base memory + retry_memory_step up to retry_memory_max.')
     res_grp.add_argument("-l", "--condor-log-dir", type=str, default="")
     res_grp.add_argument("--max-qa-jobs", type=int, default=0, help="Maximum concurrent QA jobs in DAG (0 = unconstrained up to schedd limits).")
     res_grp.add_argument("--split-nodes", type=int, default=1, help="Distribute runs across N best submit nodes (1 to 8) to avoid the 15k job schedd cap.")
@@ -656,6 +810,7 @@ def main():
     out_grp = parser.add_argument_group("Output & Submission")
     out_grp.add_argument("-o", "--output", type=str, default="test", help="Project output directory.")
     out_grp.add_argument("-o2", "--job-output-dir", "--job-output", type=str, default=None, help="Alternate output dir for raw tree/hist files.")
+    out_grp.add_argument("-e", "--email", type=str, default=None, help="Recipient email address for completion monitoring.")
     out_grp.add_argument("--submit", action="store_true", help="Automatically submit generated DAG(s) across target nodes.")
     out_grp.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging.")
 
@@ -668,22 +823,6 @@ def main():
     current_user = os.environ.get("USER", "unknown")
     ranking_user = args.user if args.user else current_user
     condor_log_dir = Path(args.condor_log_dir).resolve() if args.condor_log_dir else Path(f"/tmp/{current_user}/condor_logs")
-
-    # Determine submit nodes
-    if args.submit_nodes:
-        target_nodes = [n.strip().lower() for n in args.submit_nodes.split(",") if n.strip()]
-    elif args.split_nodes > 1:
-        ranked_nodes, node_stats = get_best_submit_nodes(user=ranking_user)
-        n_split = min(args.split_nodes, len(ranked_nodes))
-        target_nodes = ranked_nodes[:n_split]
-    else:
-        # Default single node: current host if recognized, else best ranked
-        current_host = socket.gethostname().split(".")[0].lower()
-        if current_host in SUBMISSION_NODES:
-            target_nodes = [current_host]
-        else:
-            ranked_nodes, _ = get_best_submit_nodes(user=ranking_user)
-            target_nodes = [ranked_nodes[0]]
 
     config = PipelineConfig(
         input_list=input_list,
@@ -700,11 +839,15 @@ def main():
         events=args.events,
         f4a_condor_memory=args.f4a_memory,
         QVecCalib_condor_memory=args.calib_memory,
+        max_retries=args.max_retries,
+        retry_memory_step=args.retry_memory_step,
+        retry_memory_max=args.retry_memory_max,
+        retry_request_memory=args.retry_request_memory,
         charge_threshold=args.charge_threshold,
         noise_threshold=args.noise_threshold,
         max_qa_jobs=args.max_qa_jobs,
         split_nodes=args.split_nodes,
-        submit_nodes=target_nodes,
+        submit_nodes=[],
         ranking_user=ranking_user,
         verbose=args.verbose,
     )
@@ -725,6 +868,7 @@ def main():
     directories = [
         config.output_dir,
         config.dag_dir,
+        config.dag_runs_dir,
         config.submit_dir,
         config.scripts_dir,
         config.condor_log_dir,
@@ -749,7 +893,13 @@ def main():
 
     logger.info("=" * 65)
     logger.info(config)
-    logger.info(f"Target Submit Nodes: {target_nodes}")
+    if config.retry_request_memory:
+        logger.info(f"Explicit Retry Memory: {config.retry_request_memory}")
+    elif config.retry_memory_step > 0:
+        logger.info(
+            f"Auto Memory Retry Policy: +{config.retry_memory_step} GB on OOM eviction/hold "
+            f"up to ceiling {config.retry_memory_max} GB (max {config.max_retries} retries)"
+        )
     logger.info("=" * 65)
 
     # Handle alternate output directory symlink for stage-QA
@@ -769,7 +919,52 @@ def main():
     # 1. Prepare DSTs directly from input
     run_segments = prepare_dst_lists(config)
     total_segments = sum(len(segs) for segs in run_segments.values())
-    logger.info(f"Prepared {len(run_segments)} runs with {total_segments} total segment jobs.")
+    active_runs = [r for r, segs in run_segments.items() if segs]
+    total_dag_jobs = total_segments + 4 * len(active_runs)
+    logger.info(
+        f"Prepared {len(active_runs)} active runs with {total_segments} QA segments "
+        f"({total_dag_jobs} total DAG jobs)."
+    )
+
+    # Determine submit nodes (auto-split if estimated jobs > 15,000)
+    MAX_JOBS_PER_NODE = 15000
+    ranked_nodes, _ = get_best_submit_nodes(user=ranking_user)
+
+    if args.submit_nodes:
+        target_nodes = [n.strip().lower() for n in args.submit_nodes.split(",") if n.strip()]
+        if len(target_nodes) > 0 and (total_dag_jobs / len(target_nodes)) > MAX_JOBS_PER_NODE:
+            logger.warning(
+                f"Explicit submit nodes ({len(target_nodes)}) may receive ~{math.ceil(total_dag_jobs / len(target_nodes))} "
+                f"jobs each, which exceeds {MAX_JOBS_PER_NODE} limit per node."
+            )
+    else:
+        needed_nodes = math.ceil(total_dag_jobs / MAX_JOBS_PER_NODE) if total_dag_jobs > 0 else 1
+        n_split = max(args.split_nodes, needed_nodes)
+        n_split = min(n_split, len(ranked_nodes))
+
+        if n_split > 1:
+            target_nodes = ranked_nodes[:n_split]
+            if needed_nodes > args.split_nodes:
+                logger.info(
+                    f"Auto-split triggered: {total_dag_jobs} estimated DAG jobs ({total_segments} QA segments) exceeds "
+                    f"{MAX_JOBS_PER_NODE} limit per node. Automatically partitioning across {len(target_nodes)} submit nodes: "
+                    f"{', '.join(target_nodes)} (~{math.ceil(total_dag_jobs / len(target_nodes))} jobs/node)."
+                )
+            else:
+                logger.info(
+                    f"Partitioning across {len(target_nodes)} submit nodes (user requested split={args.split_nodes}): "
+                    f"{', '.join(target_nodes)} (~{math.ceil(total_dag_jobs / len(target_nodes))} jobs/node)."
+                )
+        else:
+            current_host = socket.gethostname().split(".")[0].lower()
+            if current_host in SUBMISSION_NODES:
+                target_nodes = [current_host]
+            else:
+                target_nodes = [ranked_nodes[0]]
+            logger.info(f"Target Submit Node: {target_nodes[0]} ({total_dag_jobs} jobs <= {MAX_JOBS_PER_NODE}).")
+
+    config.submit_nodes = target_nodes
+    config.split_nodes = len(target_nodes)
 
     # 2. Helper scripts and submit templates
     hadd_sh, finalize_sh = write_helper_scripts(config)
@@ -783,9 +978,18 @@ def main():
 
     commands = []
     for node, dag_file in node_dags.items():
-        base_cmd = f"{prep_cmd}cd {config.dag_dir} && condor_submit_dag {dag_file.name}"
+        sub_file = config.dag_dir / f"{dag_file.name}.condor.sub"
+        if sub_file.exists():
+            base_cmd = f"{prep_cmd}cd {config.dag_dir} && condor_submit {sub_file.name}"
+        else:
+            base_cmd = f'{prep_cmd}cd {config.dag_dir} && condor_submit_dag -f -Append "log = {log_dir}/{dag_file.name}.dagman.log" {dag_file.name}'
         cmd = f"ssh {node} '{base_cmd}'"
         commands.append((node, dag_file, cmd))
+
+    monitor_script = Path(__file__).resolve().parent / "monitor_dag.py"
+    email_str = args.email if args.email else f"{current_user}@bnl.gov"
+    monitor_log = config.output_dir / "monitor.log"
+    monitor_nohup_cmd = f"nohup python3 -u {monitor_script} -d {config.output_dir} -i 2m -e {email_str} > {monitor_log} 2>&1 &"
 
     if not args.submit:
         print("\n" + "=" * 65)
@@ -798,6 +1002,13 @@ def main():
         for node, dag_file, cmd in commands:
             print(f"  {cmd}")
         print("\nTo monitor progress:")
+        print("  # 1. Quick dashboard status check (run once):")
+        print(f"  python3 {monitor_script} {config.output_dir} --run-once")
+        print("\n  # 2. Background monitor with email notification on completion (nohup):")
+        print(f"  {monitor_nohup_cmd}")
+        print("  # To watch the background monitor log:")
+        print(f"  tail -f {monitor_log}")
+        print("\n  # 3. Direct Condor queue & live DAGMan log:")
         for node, dag_file, _ in commands:
             print(f"  ssh {node} condor_q -dag")
             print(f"  tail -f {config.dag_dir}/{dag_file.name}.dagman.out")
@@ -807,6 +1018,16 @@ def main():
         for node, dag_file, cmd in commands:
             logger.info(f"Submitting on {node}: {cmd}")
             run_command(["bash", "-c", cmd])
+        print("\n" + "=" * 65)
+        print("Workflow Successfully Submitted!")
+        print("=" * 65)
+        print("To monitor progress:")
+        print("  # Quick dashboard status check:")
+        print(f"  python3 {monitor_script} {config.output_dir} --run-once")
+        print("\n  # Background monitor with email notification on completion (nohup):")
+        print(f"  {monitor_nohup_cmd}")
+        print("  # To watch the monitor log:")
+        print(f"  tail -f {monitor_log}\n")
 
 
 if __name__ == "__main__":
