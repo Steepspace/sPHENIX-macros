@@ -12,7 +12,6 @@
 #include <calotrigger/TriggerRunInfoReco.h>
 
 #include <calostatusskimmer/CaloStatusSkimmer.h>
-#include <caloreco/CaloTowerBuilder.h>
 
 #include <ffamodules/CDBInterface.h>
 #include <ffamodules/FlagHandler.h>
@@ -35,7 +34,6 @@
 #include <iostream>
 #include <string>
 
-
 R__LOAD_LIBRARY(libcalo_reco.so)
 R__LOAD_LIBRARY(libCaloStatusSkimmer.so)
 R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
@@ -43,7 +41,7 @@ R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
 void Fun4All_sEPD(int nEvents = 100,
                   const std::string& flist_calofit="DST_CALOFITTING_run3auau_pro001_pcdb001_v001-00068144-00000.root",
                   const std::string& flist_zdc="/direct/sphenix+tg+tg01/jets/anarde/run3auau/ZDC/68144/DST_ZDC_CALIB_run3auau_pro001_pcdb001_v001-00068144-00000.root",
-                  const std::string& flist_sepd="DST_SEPD_RAW_run3auau_pro001_pcdb001_v001-00068144-00000.root",
+                  const std::string& flist_sepd="/direct/sphenix+tg+tg01/jets/anarde/run3auau/sEPD/68144/DST_SEPD_CALIB_run3auau_pro001_pcdb001_v001-00068144-00000.root",
                   const std::string& output = "test.root",
                   const std::string& output_tree = "tree.root",
                   const std::string& dbtag = "newcdbtag")
@@ -108,17 +106,6 @@ void Fun4All_sEPD(int nEvents = 100,
   // MBD Reconstruction
   SubsysReco* mbdreco = new MbdReco();
   se->registerSubsystem(mbdreco);
-
-  CaloTowerDefs::BuilderType buildertype = CaloTowerDefs::kPRDFTowerv4;
-
-  // sEPD Reconstruction--Calib Info: Packets -> TOWERS_SEPD
-  CaloTowerBuilder *caEPD = new CaloTowerBuilder("SEPDBUILDER");
-  caEPD->set_detector_type(CaloTowerDefs::SEPD);
-  caEPD->set_builder_type(buildertype);
-  caEPD->set_processing_type(CaloWaveformProcessing::TEMPLATE);
-  caEPD->set_nsamples(12);
-  caEPD->set_offlineflag();
-  se->registerSubsystem(caEPD);
 
   // sEPD Reconstruction--Calib Info
   SubsysReco* epdreco = new EpdReco();
