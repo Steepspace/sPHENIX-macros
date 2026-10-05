@@ -19,7 +19,7 @@ if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 from qvec_qa_metrics import extract_qvec_run_metrics
-from qvec_qa_plots import plot_diagnostic_run
+from qvec_qa_plots import plot_diagnostic_run, plot_qvec_components_diagnostic
 
 
 def print_run_summary_table(metric_record: dict) -> None:
@@ -47,6 +47,24 @@ def print_run_summary_table(metric_record: dict) -> None:
         st = sm.get("status", "UNKNOWN")
 
         print(f"{sdet:<6} | {evts:<10} | {chi2:<9} | {rms:<8} | {exc:<11} | {mdev:<10} | {a1:<7} | {a2:<7} | {st}")
+    print("------------------------------------------------------------------------------------------")
+
+    # Intermediate Q-vector Component Calibration Checks
+    comp_dict = metric_record.get("components")
+    if comp_dict:
+        print("  Q-Vector Intermediate Calibration Checks (Recentering & Flattening):")
+        comp_sdet = comp_dict.get("subdetectors", {})
+        for sdet in ["N", "S"]:
+            cd = comp_sdet.get(sdet, {})
+            if cd.get("has_recentering"):
+                qx = cd.get("max_abs_qx", float("nan"))
+                qy = cd.get("max_abs_qy", float("nan"))
+                print(f"    {sdet} Arm Recentering:  max |<Qx>| = {qx:.3e}, max |<Qy>| = {qy:.3e}")
+        for sdet in ["N", "S", "NS"]:
+            cd = comp_sdet.get(sdet, {})
+            qxy = cd.get("max_abs_qxy", float("nan"))
+            r_dev = cd.get("max_dev_ratio_xxyy", float("nan"))
+            print(f"    {sdet} Arm Flattening:   max |<Qxy>| = {qxy:.3e}, max |<Qxx>/<Qyy> - 1| = {r_dev:.3e}")
     print("==========================================================================================\n")
 
 
@@ -166,6 +184,11 @@ def main():
 
         plot_diagnostic_run(res, out_plot)
         print(f"Diagnostic plot saved: {out_plot}")
+
+        if res.get("components"):
+            out_comp = out_plot.parent / f"run_{res['run_number']}_components_diagnostic.png"
+            plot_qvec_components_diagnostic(res["run_number"], res["components"], out_comp)
+            print(f"Component calibration plot saved: {out_comp}")
 
 
 if __name__ == "__main__":
