@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import mplhep as hep
 import numpy as np
 
@@ -978,3 +979,222 @@ def plot_failure_mode_metric_distribution(
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
+
+# ==============================================================================
+# 7. Q-VECTOR COMPONENT DIAGNOSTICS & TRENDS (RECENTERING & FLATTENING)
+# ==============================================================================
+
+def plot_qvec_components_diagnostic(
+    run_number: int,
+    comp_dict: Dict[str, Any],
+    output_path: Union[str, Path],
+    max_recent_dev: float = 1e-3,
+    max_twist_dev: float = 1e-3,
+    max_ratio_dev: float = 0.02,
+) -> None:
+    """
+    Generate a 3x3 diagnostic grid showing intermediate Q-vector calibrations:
+      - Row 0: Recentering <Qx> and <Qy> vs Centrality [%] (expect 0)
+      - Row 1: Twisting covariance <Qxy> vs Centrality [%] (expect 0)
+      - Row 2: Flattening variance ratio <Qxx>/<Qyy> vs Centrality [%] (expect 1.0)
+    Columns: South Arm (S), North Arm (N), North+South Combined (NS).
+    """
+    _apply_hep_style()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    subdets = ["S", "N", "NS"]
+    subdet_titles = ["South Arm (S)", "North Arm (N)", "North+South Combined (NS)"]
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12), sharex="col")
+
+    sdet_dict = comp_dict.get("subdetectors", {})
+
+    for j, (sdet, stitle) in enumerate(zip(subdets, subdet_titles)):
+        data = sdet_dict.get(sdet, {})
+
+        # -------------------------------------------------------------
+        # Row 0: Recentering <Qx> & <Qy>
+        # -------------------------------------------------------------
+        ax_r = axes[0, j]
+        ax_r.set_title(stitle, fontsize=15, fontweight="bold")
+        if data.get("has_recentering"):
+            cent = data["cent_centers"]
+            qx = data["qx_vals"]
+            qy = data["qy_vals"]
+            m_qx = data["max_abs_qx"]
+            m_qy = data["max_abs_qy"]
+
+            ax_r.plot(cent, qx, color="royalblue", linewidth=1.8, label=r"$\langle Q_x \rangle$")
+            ax_r.plot(cent, qy, color="crimson", linestyle="--", linewidth=1.8, label=r"$\langle Q_y \rangle$")
+            ax_r.axhline(0.0, color="black", linestyle=":", linewidth=1.2)
+
+            # Adaptive y-limits centered on 0
+            max_val = max(1e-4, max(m_qx if not np.isnan(m_qx) else 0, m_qy if not np.isnan(m_qy) else 0) * 1.5)
+            ax_r.set_ylim(-max_val, max_val)
+
+            info_text = (
+                rf"$\max |\langle Q_x \rangle| = {m_qx:.2e}$" + "\n" +
+                rf"$\max |\langle Q_y \rangle| = {m_qy:.2e}$" + "\n" +
+                ("PASS (Centroid = 0)" if (m_qx <= max_recent_dev and m_qy <= max_recent_dev) else "FAIL (Non-zero)")
+            )
+            border_col = "forestgreen" if (m_qx <= max_recent_dev and m_qy <= max_recent_dev) else "crimson"
+            ax_r.text(0.97, 0.95, info_text, transform=ax_r.transAxes, ha="right", va="top", fontsize=9.5,
+                      bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=border_col, alpha=0.9))
+            ax_r.legend(loc="lower left", fontsize=10, frameon=True, framealpha=0.9)
+        else:
+            # Composite NS is centered via N and S
+            ax_r.text(0.5, 0.5, "Composite Vector:\n" + r"$\vec{Q}_{\mathrm{NS}} = \vec{Q}_{\mathrm{N}} + \vec{Q}_{\mathrm{S}}$" + "\n(Centered via N & S arms)",
+                      transform=ax_r.transAxes, ha="center", va="center", fontsize=11, color="gray",
+                      bbox=dict(boxstyle="round,pad=0.4", facecolor="#f9f9f9", edgecolor="gray", alpha=0.9))
+            ax_r.set_ylim(-1e-4, 1e-4)
+
+        if j == 0:
+            ax_r.set_ylabel(r"Recentering $\langle Q_{x,y} \rangle$", fontsize=13)
+        ax_r.grid(True, linestyle="--", alpha=0.35)
+
+        # -------------------------------------------------------------
+        # Row 1: Twisting Covariance <Qxy>
+        # -------------------------------------------------------------
+        ax_t = axes[1, j]
+        if data.get("has_twisting"):
+            cent_xy = data["cent_centers_xy"]
+            qxy = data["qxy_vals"]
+            m_qxy = data["max_abs_qxy"]
+
+            ax_t.plot(cent_xy, qxy, color="darkviolet", linewidth=1.8, label=r"$\langle Q_{xy} \rangle$")
+            ax_t.axhline(0.0, color="black", linestyle=":", linewidth=1.2)
+
+            max_val = max(1e-4, (m_qxy if not np.isnan(m_qxy) else 0) * 1.5)
+            ax_t.set_ylim(-max_val, max_val)
+
+            info_text = (
+                rf"$\max |\langle Q_{{xy}} \rangle| = {m_qxy:.2e}$" + "\n" +
+                ("PASS (Cov = 0)" if m_qxy <= max_twist_dev else "FAIL (Non-zero)")
+            )
+            border_col = "forestgreen" if m_qxy <= max_twist_dev else "crimson"
+            ax_t.text(0.97, 0.95, info_text, transform=ax_t.transAxes, ha="right", va="top", fontsize=9.5,
+                      bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=border_col, alpha=0.9))
+            ax_t.legend(loc="lower left", fontsize=10, frameon=True, framealpha=0.9)
+        if j == 0:
+            ax_t.set_ylabel(r"Twisting $\langle Q_{xy} \rangle$", fontsize=13)
+        ax_t.grid(True, linestyle="--", alpha=0.35)
+
+        # -------------------------------------------------------------
+        # Row 2: Flattening Variance Ratio <Qxx> / <Qyy>
+        # -------------------------------------------------------------
+        ax_f = axes[2, j]
+        if data.get("has_flattening_ratio"):
+            cent_rat = data["cent_centers_rat"]
+            ratios = data["qxx_yy_ratios"]
+            m_dev = data["max_dev_ratio_xxyy"]
+
+            ax_f.plot(cent_rat, ratios, color="forestgreen", marker="o", markersize=3, linewidth=1.5, label=r"$\langle Q_{xx} \rangle / \langle Q_{yy} \rangle$")
+            ax_f.axhline(1.0, color="crimson", linestyle=":", linewidth=1.5, label="Target (1.0)")
+            ax_f.axhspan(0.99, 1.01, color="forestgreen", alpha=0.15, label=r"$\pm 1\%$ Band")
+
+            max_span = max(0.02, (m_dev if not np.isnan(m_dev) else 0) * 1.5)
+            ax_f.set_ylim(1.0 - max_span, 1.0 + max_span)
+
+            info_text = (
+                rf"$\max |R - 1| = {m_dev:.2e}$" + "\n" +
+                ("PASS (Ratio = 1)" if m_dev <= max_ratio_dev else "FAIL (Eccentric)")
+            )
+            border_col = "forestgreen" if m_dev <= max_ratio_dev else "crimson"
+            ax_f.text(0.97, 0.95, info_text, transform=ax_f.transAxes, ha="right", va="top", fontsize=9.5,
+                      bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=border_col, alpha=0.9))
+            ax_f.legend(loc="lower left", fontsize=10, frameon=True, framealpha=0.9)
+
+        if j == 0:
+            ax_f.set_ylabel(r"Ratio $\langle Q_{xx} \rangle / \langle Q_{yy} \rangle$", fontsize=13)
+        ax_f.set_xlabel("Centrality [%]", fontsize=14)
+        ax_f.grid(True, linestyle="--", alpha=0.35)
+
+    title = f"sEPD Intermediate Q-Vector Calibration QA: Run {run_number}"
+    fig.suptitle(title, fontsize=16, y=0.995)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_components_trends(
+    data_list: Sequence[Dict[str, Any]],
+    output_dir: Union[str, Path],
+    max_recent_dev: float = 1e-3,
+    max_twist_dev: float = 1e-3,
+    max_ratio_dev: float = 0.02,
+) -> None:
+    """
+    Generate aggregate trend plots of Q-vector component QA vs Run Number:
+      1. trends_components_recentering.png: max |<Qx>| and max |<Qy>| vs Run Number (N and S)
+      2. trends_components_flattening.png: max |<Qxy>| and max |<Qxx>/<Qyy> - 1| vs Run Number (S, N, NS)
+    """
+    _apply_hep_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    runs = [d["run_number"] for d in data_list]
+    if not runs:
+        return
+
+    # Sort by run number
+    sorted_idx = np.argsort(runs)
+    runs = np.array(runs)[sorted_idx]
+    sorted_data = [data_list[i] for i in sorted_idx]
+
+    # 1. Recentering Trends
+    fig_rec, axes_rec = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    for i, sdet in enumerate(["N", "S"]):
+        ax = axes_rec[i]
+        qx_max = np.array([d.get(f"Q_{sdet}_x_max_abs", np.nan) for d in sorted_data])
+        qy_max = np.array([d.get(f"Q_{sdet}_y_max_abs", np.nan) for d in sorted_data])
+        ax.plot(runs, qx_max, label=rf"$\max |\langle Q_x \rangle|$ ({sdet})", color="royalblue", alpha=0.85, linewidth=1.2, marker="o", markersize=3.5)
+        ax.plot(runs, qy_max, label=rf"$\max |\langle Q_y \rangle|$ ({sdet})", color="crimson", alpha=0.85, linewidth=1.2, marker="s", markersize=3.5)
+        ax.axhline(0.0, color="gray", linestyle="-", linewidth=0.8, alpha=0.5)
+        ax.axhline(max_recent_dev, color="black", linestyle="--", linewidth=1.0, alpha=0.6, label=rf"Cut ({max_recent_dev:.0e})")
+        ax.set_ylabel(rf"{sdet} Arm Max Dev", fontsize=12)
+        ax.legend(loc="upper right", fontsize=10.0, framealpha=0.9)
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.set_ylim(-1e-4, max(max_recent_dev * 1.2, 1e-3))
+    axes_rec[1].set_xlabel("Run Number", fontsize=13)
+    axes_rec[1].ticklabel_format(style="plain", useOffset=False, axis="x")
+    axes_rec[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    fig_rec.suptitle("sEPD Q-Vector Recentering QA vs Run Number (Target = 0)", fontsize=15, y=0.99)
+    fig_rec.tight_layout()
+    fig_rec.savefig(output_dir / "trends_components_recentering.png", dpi=300, bbox_inches="tight")
+    plt.close(fig_rec)
+
+    # 2. Flattening Trends (Twisting & Ratio)
+    fig_flat, axes_flat = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    colors = {"S": "royalblue", "N": "mediumvioletred", "NS": "forestgreen"}
+    markers = {"S": "o", "N": "s", "NS": "^"}
+    for sdet in ["S", "N", "NS"]:
+        qxy_max = np.array([d.get(f"Q_{sdet}_xy_max_abs", np.nan) for d in sorted_data])
+        axes_flat[0].plot(runs, qxy_max, label=f"{sdet} Arm", color=colors[sdet], alpha=0.85, linewidth=1.2, marker=markers[sdet], markersize=3.5)
+
+        ratio_dev = np.array([d.get(f"Q_{sdet}_xxyy_max_dev", np.nan) for d in sorted_data])
+        axes_flat[1].plot(runs, ratio_dev, label=f"{sdet} Arm", color=colors[sdet], alpha=0.85, linewidth=1.2, marker=markers[sdet], markersize=3.5)
+
+    axes_flat[0].axhline(0.0, color="gray", linestyle="-", linewidth=0.8, alpha=0.5)
+    axes_flat[0].axhline(max_twist_dev, color="black", linestyle="--", linewidth=1.0, alpha=0.6, label=rf"Cut ({max_twist_dev:.0e})")
+    axes_flat[0].set_ylabel(r"$\max |\langle Q_{xy} \rangle|$", fontsize=12)
+    axes_flat[0].legend(loc="upper right", fontsize=10.0, framealpha=0.9)
+    axes_flat[0].grid(True, linestyle="--", alpha=0.35)
+    axes_flat[0].set_ylim(-1e-4, max(max_twist_dev * 1.2, 1e-3))
+
+    axes_flat[1].axhline(0.0, color="gray", linestyle="-", linewidth=0.8, alpha=0.5)
+    axes_flat[1].axhline(max_ratio_dev, color="black", linestyle="--", linewidth=1.0, alpha=0.6, label=rf"Cut ({max_ratio_dev * 100:.0f}%)")
+    axes_flat[1].set_ylabel(r"$\max |\langle Q_{xx} \rangle / \langle Q_{yy} \rangle - 1|$", fontsize=12)
+    axes_flat[1].set_xlabel("Run Number", fontsize=13)
+    axes_flat[1].ticklabel_format(style="plain", useOffset=False, axis="x")
+    axes_flat[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    axes_flat[1].legend(loc="upper right", fontsize=10.0, framealpha=0.9)
+    axes_flat[1].grid(True, linestyle="--", alpha=0.35)
+    axes_flat[1].set_ylim(-1e-3, max(max_ratio_dev * 1.2, 0.02))
+
+    fig_flat.suptitle("sEPD Q-Vector Flattening QA vs Run Number (Twisting = 0, Ratio = 1)", fontsize=15, y=0.99)
+    fig_flat.tight_layout()
+    fig_flat.savefig(output_dir / "trends_components_flattening.png", dpi=300, bbox_inches="tight")
+    plt.close(fig_flat)
+

@@ -43,7 +43,9 @@ from qvec_qa_plots import (
     plot_top_flat_example,
     plot_failure_example,
     plot_failure_mode_metric_distribution,
+    plot_components_trends,
 )
+
 
 
 def write_summary_reports(
@@ -79,6 +81,20 @@ def write_summary_reports(
             f"status_{sdet}",
         ])
 
+    comp_fieldnames = [
+        "Q_N_x_max_abs",
+        "Q_N_y_max_abs",
+        "Q_S_x_max_abs",
+        "Q_S_y_max_abs",
+        "Q_N_xy_max_abs",
+        "Q_S_xy_max_abs",
+        "Q_NS_xy_max_abs",
+        "Q_N_xxyy_max_dev",
+        "Q_S_xxyy_max_dev",
+        "Q_NS_xxyy_max_dev",
+    ]
+    fieldnames.extend(comp_fieldnames)
+
     fieldnames.append("file_path")
 
     with open(csv_path, "w", newline="") as f_csv, \
@@ -107,6 +123,10 @@ def write_summary_reports(
                 row[f"A1_pct_{sdet}"] = f"{sm.get('A1_pct', np.nan):.3f}" if not np.isnan(sm.get("A1_pct", np.nan)) else "nan"
                 row[f"A2_pct_{sdet}"] = f"{sm.get('A2_pct', np.nan):.3f}" if not np.isnan(sm.get("A2_pct", np.nan)) else "nan"
                 row[f"status_{sdet}"] = sm.get("status", "UNKNOWN")
+
+            for ckey in comp_fieldnames:
+                val = d.get(ckey, np.nan)
+                row[ckey] = f"{val:.3e}" if not np.isnan(val) else "nan"
 
             writer.writerow(row)
 
@@ -335,6 +355,14 @@ def generate_flagged_arm_examples(
         if ns_s.get("status") != "GOOD":
             reasons.append(f"Combined NS: {ns_s.get('status')}")
 
+        for fl in status_overall.split(";"):
+            if "FLAG_RECENT" in fl:
+                reasons.append(f"Non-zero recentering detected: `{fl}`")
+            elif "FLAG_TWIST" in fl:
+                reasons.append(f"Non-zero twisting covariance detected: `{fl}`")
+            elif "FLAG_FLAT_ECCENTRICITY" in fl:
+                reasons.append(f"Flattening variance ratio deviation: `{fl}`")
+
         reason_str = "<br>".join(reasons) if reasons else "Threshold exceeded"
 
         readme_lines.append(
@@ -365,6 +393,9 @@ def reevaluate_data_list(
     max_excess_rms: float = 2.0,
     max_dev_pct: float = 12.0,
     max_a: float = 1.0,
+    max_recent_dev: float = 1e-3,
+    max_twist_dev: float = 1e-3,
+    max_ratio_dev: float = 0.02,
 ) -> None:
     """
     Re-evaluate QA pass/fail status flags on cached metrics without re-reading ROOT files.
@@ -383,8 +414,42 @@ def reevaluate_data_list(
                 max_a2=max_a,
             )
         primary_status = subdets.get("NS", {}).get("status", "UNKNOWN")
-        all_statuses = [sm.get("status", "UNKNOWN") for sm in subdets.values()]
-        overall_status = "GOOD" if all(s == "GOOD" for s in all_statuses) else ";".join(sorted(set(filter(lambda s: s != "GOOD", all_statuses))))
+        all_flags = []
+        for sdet, sm in subdets.items():
+            st = sm.get("status", "UNKNOWN")
+            if st != "GOOD":
+                for flag in st.split(";"):
+                    entry = f"{flag}_{sdet}" if len(subdetectors) > 1 else flag
+                    if entry not in all_flags:
+                        all_flags.append(entry)
+
+        # Check component flags if present
+        for sdet in ["N", "S"]:
+            qx_max = d.get(f"Q_{sdet}_x_max_abs", np.nan)
+            qy_max = d.get(f"Q_{sdet}_y_max_abs", np.nan)
+            if not np.isnan(qx_max) and qx_max > max_recent_dev:
+                f_name = f"FLAG_RECENT_NONZERO_{sdet}"
+                if f_name not in all_flags:
+                    all_flags.append(f_name)
+            if not np.isnan(qy_max) and qy_max > max_recent_dev:
+                f_name = f"FLAG_RECENT_NONZERO_{sdet}"
+                if f_name not in all_flags:
+                    all_flags.append(f_name)
+
+        for sdet in ["N", "S", "NS"]:
+            qxy_max = d.get(f"Q_{sdet}_xy_max_abs", np.nan)
+            if not np.isnan(qxy_max) and qxy_max > max_twist_dev:
+                f_name = f"FLAG_TWIST_NONZERO_{sdet}"
+                if f_name not in all_flags:
+                    all_flags.append(f_name)
+
+            xxyy_dev = d.get(f"Q_{sdet}_xxyy_max_dev", np.nan)
+            if not np.isnan(xxyy_dev) and xxyy_dev > max_ratio_dev:
+                f_name = f"FLAG_FLAT_ECCENTRICITY_{sdet}"
+                if f_name not in all_flags:
+                    all_flags.append(f_name)
+
+        overall_status = ";".join(sorted(all_flags)) if all_flags else "GOOD"
         d["primary_status"] = primary_status
         d["status"] = overall_status
         if "NS" in subdets:
@@ -486,6 +551,31 @@ def main():
         help="Number of representative top flattest runs to save for reference (default: 3).",
     )
 
+    # Component Calibration Checks
+    parser.add_argument(
+        "--no-components",
+        action="store_true",
+        help="Disable intermediate Q-vector component QA checks (recentering, twisting, variance ratio).",
+    )
+    parser.add_argument(
+        "--max-recent-dev",
+        type=float,
+        default=1e-3,
+        help="Maximum deviation for <Qx> and <Qy> recentering (default: 1e-3).",
+    )
+    parser.add_argument(
+        "--max-twist-dev",
+        type=float,
+        default=1e-3,
+        help="Maximum deviation for <Qxy> twisting (default: 1e-3).",
+    )
+    parser.add_argument(
+        "--max-ratio-dev",
+        type=float,
+        default=0.02,
+        help="Maximum deviation from 1.0 for <Qxx>/<Qyy> ratio (default: 0.02).",
+    )
+
     # Caching options
     parser.add_argument(
         "--cache",
@@ -559,6 +649,9 @@ def main():
                 max_excess_rms=args.max_excess_rms,
                 max_dev_pct=args.max_dev,
                 max_a=args.max_a,
+                max_recent_dev=args.max_recent_dev,
+                max_twist_dev=args.max_twist_dev,
+                max_ratio_dev=args.max_ratio_dev,
             )
         except Exception as e:
             print(f"Warning: Failed to load cache from {cache_path}: {e}. Falling back to ROOT files.")
@@ -603,6 +696,10 @@ def main():
             max_dev_pct=args.max_dev,
             max_a1=args.max_a,
             max_a2=args.max_a,
+            check_components=not args.no_components,
+            max_recent_dev=args.max_recent_dev,
+            max_twist_dev=args.max_twist_dev,
+            max_ratio_dev=args.max_ratio_dev,
         )
 
         errors: List[str] = []
@@ -718,7 +815,20 @@ def main():
     plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_modulation_zoomed.png", metric_type="modulation", max_a=args.max_a, zoomed=True)
     print(f"  - 1x3 Comparison plots saved in {dist_dir.name}/")
 
-    # 6. Generate Top Flat Run Examples
+    # 6. Generate Q-vector component QA trends (recentering & flattening)
+    has_comp = any("Q_N_x_max_abs" in d for d in data_list)
+    if has_comp:
+        print(f"\nGenerating aggregate Q-vector component QA trend plots...")
+        plot_components_trends(
+            data_list,
+            output_dir,
+            max_recent_dev=args.max_recent_dev,
+            max_twist_dev=args.max_twist_dev,
+            max_ratio_dev=args.max_ratio_dev,
+        )
+        print(f"  - Component trend plots saved: trends_components_recentering.png, trends_components_flattening.png")
+
+    # 7. Generate Top Flat Run Examples
     if args.top_flat_examples > 0:
         print(f"\nSelecting top {args.top_flat_examples} flattest runs and generating diagnostic reference plots...")
         top_runs = generate_top_flat_examples(
