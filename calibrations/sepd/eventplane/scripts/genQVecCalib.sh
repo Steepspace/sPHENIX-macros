@@ -2,10 +2,21 @@
 export USER="$(id -u -n)"
 export LOGNAME=${USER}
 export HOME=/sphenix/u/${LOGNAME}
-export MYINSTALL="$HOME/Documents/sPHENIX/install" # Testing
+# sPHENIX build (and local install) come from the submit file environment, set by the submitter
+build="${SPHENIX_BUILD:-${OFFLINE_MAIN:+$(basename "$OFFLINE_MAIN")}}"
+if [[ -z "$build" ]]; then
+    echo "Error: SPHENIX_BUILD is not set" >&2
+    exit 1
+fi
+# local install only when the submitter passes one (--myinstall); $MYINSTALL is ignored
+myinstall="${SPHENIX_MYINSTALL:-none}"
 
-source /opt/sphenix/core/bin/sphenix_setup.sh -n new
-source /opt/sphenix/core/bin/setup_local.sh $MYINSTALL # Testing
+source /opt/sphenix/core/bin/sphenix_setup.sh -n "$build"
+if [[ "$myinstall" != "none" ]]; then
+    export MYINSTALL="$myinstall"
+    source /opt/sphenix/core/bin/setup_local.sh "$MYINSTALL"
+fi
+echo "sPHENIX build: $build ($OFFLINE_MAIN), MyInstall: $myinstall"
 
 f4a_macro=${1}
 input=${2}

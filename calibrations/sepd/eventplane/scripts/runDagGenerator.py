@@ -29,12 +29,22 @@ Key Architecture:
    - Schedulers can run unthrottled (default) or capped with user-defined limits.
    - SCRIPT POST finalizes outputs per run into CDB/ and QVecCalib/ as soon as Pass 2 completes.
 
+5. Reproducibility (sPHENIX build pinning):
+   - -b/--build is resolved to a concrete release at generation time (e.g. new -> new.6) and
+     passed to every job via the submit file environment (SPHENIX_BUILD / SPHENIX_MYINSTALL),
+     so all passes of a run use the same release even if the rolling tag moves mid-DAG.
+   - rebuild.info / rebuild.log of that release are copied into the output directory.
+   - Macros and worker scripts are copied to <output>/scripts/ and the jobs run those copies.
+   - Every R__LOAD_LIBRARY in the macros is checked against the worker library path before
+     anything is written.
+
 Author: Apurva Narde & Pair Programming Assistant
 Date: 2026
 """
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import datetime
 import logging
 import math
 import os
@@ -50,6 +60,170 @@ from pathlib import Path
 logger = logging.getLogger("DAGGen")
 
 SUBMISSION_NODES = [f"sphnxuser{i:02d}" for i in range(1, 9)]
+
+
+# -----------------------------------------------------------------------------
+# sPHENIX Build Pinning
+# -----------------------------------------------------------------------------
+
+class BuildError(RuntimeError):
+    """Raised when the requested build or install cannot be used."""
+
+
+@dataclass
+class BuildInfo:
+    tag: str         # build as requested (e.g. new)
+    build: str       # concrete release (e.g. new.6)
+    build_dir: Path  # resolved release directory
+    myinstall: str   # absolute path of the local install, or "none"
+
+    def submit_environment(self) -> str:
+        """Condor submit file line passing the build to the worker scripts."""
+        return f'environment          = "SPHENIX_BUILD={self.build} SPHENIX_MYINSTALL={self.myinstall}"'
+
+    def __str__(self) -> str:
+        return f"{self.build} (requested: {self.tag}) -> {self.build_dir}, MyInstall: {self.myinstall}"
+
+
+def add_build_args(parser) -> None:
+    """Adds -b/--build and --myinstall to an argparse parser or argument group."""
+    default_build = Path(os.environ["OFFLINE_MAIN"]).name if os.environ.get("OFFLINE_MAIN") else None
+    parser.add_argument(
+        "-b", "--build", dest="build", type=str, default=default_build, required=default_build is None,
+        help="sPHENIX build tag/version (e.g. new, ana.588), resolved to the concrete build at submit time. "
+             "Default: the build of the current shell ($OFFLINE_MAIN).",
+    )
+    parser.add_argument(
+        "--myinstall", "--install-dir", dest="myinstall", type=str, default="none",
+        help='Local install directory sourced via setup_local.sh on the workers. Only used when passed explicitly '
+             '($MYINSTALL is ignored). Default: none.',
+    )
+
+
+def find_build_dir(build: str) -> Path | None:
+    """
+    Resolves a build tag (e.g. new, new.6, ana, ana.588) to its release directory, using the same
+    lookup as `sphenix_setup.sh -n <build>`: <optbasepath>/release/<build>, with optbasepath
+    three levels above $OPT_SPHENIX. Symlinks are resolved, so a rolling tag like 'new' maps to
+    the concrete build it currently points to. Returns None if not found.
+    """
+    if not os.environ.get("OPT_SPHENIX"):
+        return None
+    build_dir = Path(os.environ["OPT_SPHENIX"]).parents[2] / "release" / build
+    if build_dir.is_dir():
+        return build_dir.resolve()
+    return None
+
+
+def resolve_build(build_tag: str, raw_install: str | None) -> BuildInfo:
+    """Resolves --build and --myinstall. Raises BuildError if either is unusable."""
+    build_dir = find_build_dir(build_tag)
+    if not build_dir:
+        raise BuildError(f'sPHENIX build "{build_tag}" not found ($OPT_SPHENIX: {os.environ.get("OPT_SPHENIX")})')
+
+    if not raw_install or raw_install.lower() == "none":
+        myinstall = "none"
+    else:
+        install_path = Path(os.path.expandvars(os.path.expanduser(raw_install)))
+        myinstall = str(install_path.resolve())
+        if not install_path.is_dir():
+            raise BuildError(f"Install directory does not exist: {myinstall} (from --myinstall {raw_install})")
+        if not (install_path / "lib").is_dir():
+            raise BuildError(f"Install directory has no lib/: {myinstall}")
+
+    return BuildInfo(tag=build_tag, build=build_dir.name, build_dir=build_dir, myinstall=myinstall)
+
+
+def check_install_age(info: BuildInfo) -> str | None:
+    """
+    Returns a warning if the local install's newest library predates the resolved build, since a
+    rolling tag like 'new' may have moved on and the install's libraries may no longer match it.
+    """
+    if info.myinstall == "none":
+        return None
+    build_info = info.build_dir / "rebuild.info"
+    libs = list((Path(info.myinstall) / "lib").glob("*.so*"))
+    if not build_info.is_file() or not libs:
+        return None
+    install_time = max(lib.stat().st_mtime for lib in libs)
+    build_time = build_info.stat().st_mtime
+    if install_time >= build_time:
+        return None
+
+    def fmt(t: float) -> str:
+        return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+
+    return (
+        f"Install {info.myinstall} (newest lib {fmt(install_time)}) is older than build "
+        f"{info.build} ({fmt(build_time)}). Consider rebuilding the install against {info.build}."
+    )
+
+
+def library_search_dirs(info: BuildInfo) -> list[Path]:
+    """
+    Directories the worker's LD_LIBRARY_PATH will contain after sphenix_setup.sh / setup_local.sh.
+    The submit shell's LD_LIBRARY_PATH is deliberately not used, since it may include a different install.
+    """
+    dirs = []
+    if info.myinstall != "none":
+        dirs.append(Path(info.myinstall) / "lib")
+    dirs.extend([info.build_dir / "lib", info.build_dir / "lib64"])
+    for var in ["OPT_SPHENIX", "OPT_UTILS"]:
+        if os.environ.get(var):
+            dirs.extend([Path(os.environ[var]) / "lib", Path(os.environ[var]) / "lib64"])
+    if os.environ.get("ROOTSYS"):
+        dirs.append(Path(os.environ["ROOTSYS"]) / "lib")
+    return [d for d in dirs if d.is_dir()]
+
+
+def check_macro_libraries(macro: Path, search_dirs: list[Path], visited: set[Path] | None = None) -> list[tuple[Path, str]]:
+    """
+    Checks that every R__LOAD_LIBRARY in a ROOT macro (and in macros it #includes by quoted path)
+    resolves in the worker's library search dirs. Returns a list of (macro, library) that do not.
+    """
+    visited = set() if visited is None else visited
+    macro = Path(macro).resolve()
+    if macro in visited or not macro.is_file():
+        return []
+    visited.add(macro)
+
+    text = re.sub(r"/\*.*?\*/", "", macro.read_text(encoding="utf-8", errors="replace"), flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+
+    missing = []
+    for lib in re.findall(r'R__LOAD_LIBRARY\(\s*"?([^\s")]+)"?\s*\)', text):
+        lib_path = Path(lib)
+        found = lib_path.is_file() if lib_path.is_absolute() else any((d / lib).exists() for d in search_dirs)
+        if not found:
+            missing.append((macro, lib))
+    for inc in re.findall(r'#include\s+"([^"]+)"', text):
+        missing.extend(check_macro_libraries(macro.parent / inc, search_dirs, visited))
+    return missing
+
+
+def validate_macros(info: BuildInfo, macros: list[Path]) -> None:
+    """Raises BuildError listing every R__LOAD_LIBRARY in the macros that the worker could not load."""
+    search_dirs = library_search_dirs(info)
+    visited: set[Path] = set()
+    missing = []
+    for macro in macros:
+        missing.extend(check_macro_libraries(macro, search_dirs, visited))
+    if missing:
+        lines = [f"{m.name}: R__LOAD_LIBRARY({lib}) not found" for m, lib in missing]
+        lines.append(f"Searched: {', '.join(str(d) for d in search_dirs)}")
+        raise BuildError("\n".join(lines))
+
+
+def copy_build_info(info: BuildInfo, dest: Path) -> list[str]:
+    """Copies rebuild.info and rebuild.log of the resolved build into dest. Returns missing file names."""
+    missing = []
+    for fname in ["rebuild.info", "rebuild.log"]:
+        src = info.build_dir / fname
+        if src.is_file():
+            shutil.copy(src, dest)
+        else:
+            missing.append(fname)
+    return missing
 
 
 # -----------------------------------------------------------------------------
@@ -86,6 +260,7 @@ class PipelineConfig:
     ranking_user: str
     threads: int
     verbose: bool
+    build: BuildInfo
 
     @property
     def stage_qa_dir(self) -> Path:
@@ -393,7 +568,13 @@ def write_helper_scripts(config: PipelineConfig) -> tuple[Path, Path]:
     hadd_sh.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
         set -e
-        source /opt/sphenix/core/bin/sphenix_setup.sh -n new
+        # sPHENIX build comes from the submit file environment (SPHENIX_BUILD)
+        build="${SPHENIX_BUILD:-${OFFLINE_MAIN:+$(basename "$OFFLINE_MAIN")}}"
+        if [[ -z "$build" ]]; then
+            echo "Error: SPHENIX_BUILD is not set" >&2
+            exit 1
+        fi
+        source /opt/sphenix/core/bin/sphenix_setup.sh -n "$build"
 
         out_file="$1"
         in_dir="$2"
@@ -554,6 +735,7 @@ def write_condor_submit_templates(
         ]
         if retry_mem:
             lines.append(f"retry_request_memory = {retry_mem}")
+        lines.append(config.build.submit_environment())
         if config.max_retries > 0:
             lines.append(f"max_retries          = {config.max_retries}")
         lines.append("queue\n")
@@ -831,6 +1013,9 @@ def main():
     opt_grp.add_argument("-e1", "--f4a-script", type=str, default="scripts/genFun4All.sh")
     opt_grp.add_argument("-e2", "--QVecCalib-script", type=str, default="scripts/genQVecCalib.sh")
 
+    build_grp = parser.add_argument_group("sPHENIX Build")
+    add_build_args(build_grp)
+
     param_grp = parser.add_argument_group("Parameters & Thresholds")
     param_grp.add_argument("-n1", "--segments", type=int, default=50, help="Segments per run to process (0 = all).")
     param_grp.add_argument("-n2", "--events", type=int, default=0, help="Events per job (0 = all).")
@@ -870,6 +1055,13 @@ def main():
     ranking_user = args.user if args.user else current_user
     condor_log_dir = Path(args.condor_log_dir).resolve() if args.condor_log_dir else Path(f"/tmp/{current_user}/condor_logs")
 
+    # Pin the sPHENIX build: every job of every pass runs this concrete release (e.g. new -> new.6)
+    try:
+        build = resolve_build(args.build, args.myinstall)
+    except BuildError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     config = PipelineConfig(
         input_list=input_list,
         f4a_macro=Path(args.f4a_macro).resolve(),
@@ -897,6 +1089,7 @@ def main():
         ranking_user=ranking_user,
         threads=args.threads,
         verbose=args.verbose,
+        build=build,
     )
 
     # Validation
@@ -910,6 +1103,18 @@ def main():
         if not f.is_file():
             print(f"Error: Missing required input file: {f}", file=sys.stderr)
             sys.exit(1)
+
+    # Every R__LOAD_LIBRARY in the job macros must resolve on the worker
+    try:
+        validate_macros(config.build, [config.f4a_macro, config.f4a_QVecCalib])
+    except BuildError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    snapshot_names = [p.name for p in [config.f4a_macro, config.f4a_QVecCalib, config.f4a_script, config.QVecCalib_script]]
+    if len(set(snapshot_names)) != len(snapshot_names):
+        print(f"Error: Macros and worker scripts must have distinct file names to be copied together: {snapshot_names}", file=sys.stderr)
+        sys.exit(1)
 
     # Directory Setup
     directories = [
@@ -937,6 +1142,25 @@ def main():
     # Setup Logging
     log_file = config.output_dir / "dag_generator.log"
     setup_logging(log_file, config.verbose)
+
+    # Snapshot the macros and worker scripts: jobs run these copies, so editing the sources
+    # while the DAG runs does not change later passes, and the outputs keep what produced them.
+    for field in ["f4a_macro", "f4a_QVecCalib", "f4a_script", "QVecCalib_script"]:
+        src = getattr(config, field)
+        dst = config.scripts_dir / src.name
+        shutil.copy2(src, dst)
+        setattr(config, field, dst)
+        logger.info(f"Copied {src} -> {dst}")
+
+    # Record the release the jobs run against
+    missing_info = copy_build_info(config.build, config.output_dir)
+    for fname in missing_info:
+        logger.warning(f"{fname} not found in {config.build.build_dir}")
+    if len(missing_info) < 2:
+        logger.info(f"Copied rebuild info from {config.build.build_dir} to {config.output_dir}")
+    install_warning = check_install_age(config.build)
+    if install_warning:
+        logger.warning(install_warning)
 
     logger.info("=" * 65)
     logger.info(config)
