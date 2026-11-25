@@ -142,6 +142,14 @@ def write_summary_reports(
     print(f"Flagged outlier runs list written to: {flagged_list_path}")
 
 
+def is_empty_run(d: Dict[str, Any]) -> bool:
+    """True if every subdetector of the run is FLAG_EMPTY_OR_ZERO (no events, nothing to plot)."""
+    subdets = d.get("subdetectors", {})
+    return bool(subdets) and all(
+        "FLAG_EMPTY_OR_ZERO" in sm.get("status", "").split(";") for sm in subdets.values()
+    )
+
+
 def generate_failure_mode_examples(
     metrics_list: List[Dict[str, Any]],
     output_dir: Union[str, Path],
@@ -221,6 +229,10 @@ def generate_failure_mode_examples(
 
         for d in selected:
             used_runs.add(d["run_number"])
+
+        # Runs without events have no distributions to show; list them only
+        if mode == "FLAG_EMPTY_OR_ZERO":
+            continue
 
         mode_dir = examples_dir / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
@@ -306,11 +318,14 @@ def generate_flagged_arm_examples(
     flagged_dir = output_dir / "flagged_arm_runs"
     flagged_dir.mkdir(parents=True, exist_ok=True)
 
-    flagged_runs = [
+    all_flagged = [
         d for d in metrics_list
         if d.get("status") != "GOOD"
         or any(sm.get("status") != "GOOD" for sm in d.get("subdetectors", {}).values())
     ]
+    # Runs with no events in any arm would only give empty plots: list them, don't plot them
+    empty_runs = sorted(d["run_number"] for d in all_flagged if is_empty_run(d))
+    flagged_runs = [d for d in all_flagged if not is_empty_run(d)]
     flagged_run_numbers = []
 
     readme_lines = [
@@ -318,7 +333,9 @@ def generate_flagged_arm_examples(
         "This directory contains detailed diagnostic plots for runs where one or more detector arms",
         "were flagged with a non-GOOD status during Q-vector flatness QA.\n",
         f"- **Total Runs Analyzed:** {len(metrics_list):,}",
-        f"- **Flagged Runs Identified:** {len(flagged_runs)}\n",
+        f"- **Flagged Runs Identified:** {len(all_flagged)}",
+        f"- **Flagged Runs Plotted:** {len(flagged_runs)}",
+        f"- **Empty Runs (FLAG_EMPTY_OR_ZERO in every arm, not plotted):** {len(empty_runs)}\n",
         "| Run Number | Overall Status | Primary (NS) | North Arm (N) | South Arm (S) | Events | Root Cause / Detailed Explanation |",
         "|:---:|:---:|:---:|:---:|:---:|:---:|:---|",
     ]
@@ -377,6 +394,14 @@ def generate_flagged_arm_examples(
             show_suptitle=False,
             zoom_ratio=True,
         )
+
+    if empty_runs:
+        readme_lines.extend([
+            "",
+            f"## Empty Runs ({len(empty_runs)})\n",
+            "No events in any arm (zero events or missing histogram), so no diagnostic plot is made.\n",
+            ", ".join(str(r) for r in empty_runs),
+        ])
 
     with open(flagged_dir / "README.md", "w") as f_rm:
         f_rm.write("\n".join(readme_lines) + "\n")
