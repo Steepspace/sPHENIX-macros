@@ -35,6 +35,36 @@ if [[ -z "$run" || ! "$run" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+# Stage the DSTs of one input list into the current directory and rewrite the list with the local
+# file names for the macro. Bare file names (e.g. DST_CALOFITTING_*) are fetched with getinputfiles.pl;
+# full paths (e.g. /direct/.../DST_SEPD_CALIB_*) are copied directly.
+stage_list() {
+    local list="$1"
+    local fetch_list="${list%.list}.fetch.list"
+
+    grep -v -e '^/' -e '^[[:space:]]*$' "$list" > "$fetch_list" || true
+    if [[ -s "$fetch_list" ]]; then
+        getinputfiles.pl --verbose --filelist "$fetch_list" || {
+            echo "Error: getinputfiles.pl failed for $list at $(date) on $(hostname)" >&2
+            return 1
+        }
+    fi
+
+    local path attempt
+    while IFS= read -r path; do
+        [[ "$path" == /* ]] || continue
+        for attempt in 1 2 3; do
+            cp -v "$path" . && continue 2
+            echo "cp of $path failed (likely GPFS lag). Retrying ($attempt/3) in 15 seconds..." >&2
+            sleep 15
+        done
+        echo "Error: could not copy $path for $list at $(date) on $(hostname)" >&2
+        return 1
+    done < "$list"
+
+    sed -e 's#.*/##' -e '/^[[:space:]]*$/d' "$list" > "$list.local" && mv "$list.local" "$list"
+}
+
 if [[ -n "$_CONDOR_SCRATCH_DIR" && -d "$_CONDOR_SCRATCH_DIR" ]]
 then
     cd "$_CONDOR_SCRATCH_DIR" || { echo "Failed to cd to $_CONDOR_SCRATCH_DIR" >&2; exit 1; }
@@ -53,10 +83,9 @@ then
             exit 1
         fi
 
-        getinputfiles.pl --verbose --filelist "$list" || {
-            echo "Error: getinputfiles.pl failed for $list at $(date) on $(hostname)" >&2
+        stage_list "$list" || {
             mkdir -p "$submitDir/failures"
-            echo "getinputfiles failure ($list) for $input on $(hostname) at $(date)" >> "$submitDir/failures/failure-log.txt"
+            echo "input staging failure ($list) for $input on $(hostname) at $(date)" >> "$submitDir/failures/failure-log.txt"
             exit 1
         }
     done

@@ -44,6 +44,27 @@ R__LOAD_LIBRARY(libzdcinfo.so)
 R__LOAD_LIBRARY(libCaloStatusSkimmer.so)
 R__LOAD_LIBRARY(libsepd_eventplanecalib.so)
 
+// First file of an input: the file itself, or the first line of a file list
+std::string first_input_file(const std::string& input, bool isFileList)
+{
+  if (!isFileList)
+  {
+    return input;
+  }
+  std::ifstream infile_stream(input);
+  std::string filepath;
+  getline(infile_stream, filepath);
+  return filepath;
+}
+
+// Calibrated DSTs (e.g. DST_ZDC_CALIB_*, DST_SEPD_CALIB_*) already contain the reconstructed
+// detector nodes; raw DSTs (DST_ZDC_RAW_*, DST_SEPD_RAW_*) need the tower building.
+bool is_calib_dst(const std::string& filepath)
+{
+  const std::string name = filepath.substr(filepath.find_last_of('/') + 1);
+  return name.find("_CALIB_") != std::string::npos;
+}
+
 void Fun4All_sEPD(int nEvents = 100,
                   const std::string& flist_calofit="DST_CALOFITTING_run3auau_pro001_pcdb001_v001-00068144-00000.root",
                   const std::string& flist_zdc="DST_ZDC_RAW_run3auau_pro001_pcdb001_v001-00068144-00000.root",
@@ -77,11 +98,17 @@ void Fun4All_sEPD(int nEvents = 100,
     infile_stream.close();
   }
 
+  // Raw inputs are reconstructed here; calibrated inputs skip the steps already applied to them:
+  //   DST_ZDC_CALIB  (Zdcinfo)      -> skip ZDC CaloTowerBuilder and ZdcReco
+  //   DST_SEPD_CALIB (TOWERS_SEPD)  -> skip sEPD CaloTowerBuilder (EpdReco still runs)
+  const bool zdc_calib = is_calib_dst(first_input_file(flist_zdc, isFileList));
+  const bool sepd_calib = is_calib_dst(first_input_file(flist_sepd, isFileList));
+
   std::cout << "########################" << std::endl;
   std::cout << "Run Parameters" << std::endl;
   std::cout << "input calofit: " << flist_calofit << std::endl;
-  std::cout << "input zdc: " << flist_zdc << std::endl;
-  std::cout << "input sepd: " << flist_sepd << std::endl;
+  std::cout << "input zdc: " << flist_zdc << (zdc_calib ? " (CALIB)" : " (RAW)") << std::endl;
+  std::cout << "input sepd: " << flist_sepd << (sepd_calib ? " (CALIB)" : " (RAW)") << std::endl;
   std::cout << "output: " << output << std::endl;
   std::cout << "output tree: " << output_tree << std::endl;
   std::cout << "nEvents: " << nEvents << std::endl;
@@ -113,12 +140,15 @@ void Fun4All_sEPD(int nEvents = 100,
   // sEPD Reconstruction--Calib Info
   CaloTowerDefs::BuilderType buildertype = CaloTowerDefs::kPRDFTowerv4;
 
-  // sEPD Reconstruction--Calib Info: Packets -> TOWERS_SEPD
-  CaloTowerBuilder *caEPD = new CaloTowerBuilder("SEPDBUILDER");
-  caEPD->set_detector_type(CaloTowerDefs::SEPD);
-  caEPD->set_builder_type(buildertype);
-  caEPD->set_processing_type(CaloWaveformProcessing::TEMPLATE);
-  se->registerSubsystem(caEPD);
+  // sEPD Reconstruction--Calib Info: Packets -> TOWERS_SEPD (already in DST_SEPD_CALIB)
+  if (!sepd_calib)
+  {
+    CaloTowerBuilder *caEPD = new CaloTowerBuilder("SEPDBUILDER");
+    caEPD->set_detector_type(CaloTowerDefs::SEPD);
+    caEPD->set_builder_type(buildertype);
+    caEPD->set_processing_type(CaloWaveformProcessing::TEMPLATE);
+    se->registerSubsystem(caEPD);
+  }
 
   SubsysReco* epdreco = new EpdReco();
   se->registerSubsystem(epdreco);
@@ -132,19 +162,23 @@ void Fun4All_sEPD(int nEvents = 100,
   trig->Verbosity(1);
   se->registerSubsystem(trig);
 
-  // build ZDC towers
-  CaloTowerBuilder *caZDC = new CaloTowerBuilder("ZDCBUILDER");
-  caZDC->set_detector_type(CaloTowerDefs::ZDC);
-  caZDC->set_builder_type(buildertype);
-  caZDC->set_processing_type(CaloWaveformProcessing::FUNCFIT);
-  caZDC->set_funcfit_type(2);
-  se->registerSubsystem(caZDC);
+  // ZDC towers and Zdcinfo (already in DST_ZDC_CALIB)
+  if (!zdc_calib)
+  {
+    // build ZDC towers
+    CaloTowerBuilder *caZDC = new CaloTowerBuilder("ZDCBUILDER");
+    caZDC->set_detector_type(CaloTowerDefs::ZDC);
+    caZDC->set_builder_type(buildertype);
+    caZDC->set_processing_type(CaloWaveformProcessing::FUNCFIT);
+    caZDC->set_funcfit_type(2);
+    se->registerSubsystem(caZDC);
 
-  // ZDC Reconstruction--Calib Info
-  ZdcReco* zdcreco = new ZdcReco();
-  zdcreco->set_zdc1_cut(0.0);
-  zdcreco->set_zdc2_cut(0.0);
-  se->registerSubsystem(zdcreco);
+    // ZDC Reconstruction--Calib Info
+    ZdcReco* zdcreco = new ZdcReco();
+    zdcreco->set_zdc1_cut(0.0);
+    zdcreco->set_zdc2_cut(0.0);
+    se->registerSubsystem(zdcreco);
+  }
 
   // Minimum Bias Classifier
   MinimumBiasClassifier* mb = new MinimumBiasClassifier();
