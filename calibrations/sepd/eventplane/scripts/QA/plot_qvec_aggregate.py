@@ -32,7 +32,15 @@ script_dir = Path(__file__).resolve().parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
-from qvec_qa_metrics import extract_qvec_run_metrics, evaluate_subdet_status
+from qvec_qa_metrics import (
+    DEFAULT_CENT_SLICES,
+    add_cut_args,
+    cuts_from_args,
+    evaluate_run,
+    extract_qvec_run_metrics,
+    parse_cent_slices,
+    slice_label,
+)
 from qvec_qa_plots import (
     plot_heatmap,
     plot_trends,
@@ -44,8 +52,27 @@ from qvec_qa_plots import (
     plot_failure_example,
     plot_failure_mode_metric_distribution,
     plot_components_trends,
+    plot_slice_summary,
 )
 
+
+def _fmt(value: Any, spec: str) -> str:
+    return "nan" if value is None or np.isnan(value) else format(value, spec)
+
+
+SUBDET_CSV_FIELDS = [
+    ("total_events", ".0f"),
+    ("chi2_ndf", ".3f"),
+    ("rms_pct", ".3f"),
+    ("rms_sigma", ".3f"),
+    ("rms_excess_pct", ".3f"),
+    ("max_dev_pct", ".2f"),
+    ("max_dev_sigma", ".2f"),
+    ("A1_pct", ".3f"),
+    ("A1_sig", ".2f"),
+    ("A2_pct", ".3f"),
+    ("A2_sig", ".2f"),
+]
 
 
 def write_summary_reports(
@@ -68,18 +95,12 @@ def write_summary_reports(
         "total_events",
         "primary_status",
         "overall_status",
+        "slice_status",
     ]
 
     for sdet in subdetectors:
-        fieldnames.extend([
-            f"chi2_ndf_{sdet}",
-            f"rms_pct_{sdet}",
-            f"rms_excess_pct_{sdet}",
-            f"max_dev_pct_{sdet}",
-            f"A1_pct_{sdet}",
-            f"A2_pct_{sdet}",
-            f"status_{sdet}",
-        ])
+        fieldnames.extend(f"{k}_{sdet}" for k, _ in SUBDET_CSV_FIELDS if k != "total_events")
+        fieldnames.append(f"status_{sdet}")
 
     comp_fieldnames = [
         "Q_N_x_max_abs",
@@ -110,18 +131,16 @@ def write_summary_reports(
                 "total_events": f"{d['total_events']:.0f}",
                 "primary_status": d["primary_status"],
                 "overall_status": d["status"],
+                "slice_status": d.get("slice_status", "not evaluated"),
                 "file_path": d["file_path"],
             }
 
             subdets_dict = d.get("subdetectors", {})
             for sdet in subdetectors:
                 sm = subdets_dict.get(sdet, {})
-                row[f"chi2_ndf_{sdet}"] = f"{sm.get('chi2_ndf', np.nan):.3f}" if not np.isnan(sm.get("chi2_ndf", np.nan)) else "nan"
-                row[f"rms_pct_{sdet}"] = f"{sm.get('rms_pct', np.nan):.3f}" if not np.isnan(sm.get("rms_pct", np.nan)) else "nan"
-                row[f"rms_excess_pct_{sdet}"] = f"{sm.get('rms_excess_pct', np.nan):.3f}" if not np.isnan(sm.get("rms_excess_pct", np.nan)) else "nan"
-                row[f"max_dev_pct_{sdet}"] = f"{sm.get('max_dev_pct', np.nan):.2f}" if not np.isnan(sm.get("max_dev_pct", np.nan)) else "nan"
-                row[f"A1_pct_{sdet}"] = f"{sm.get('A1_pct', np.nan):.3f}" if not np.isnan(sm.get("A1_pct", np.nan)) else "nan"
-                row[f"A2_pct_{sdet}"] = f"{sm.get('A2_pct', np.nan):.3f}" if not np.isnan(sm.get("A2_pct", np.nan)) else "nan"
+                for k, spec in SUBDET_CSV_FIELDS:
+                    if k != "total_events":
+                        row[f"{k}_{sdet}"] = _fmt(sm.get(k, np.nan), spec)
                 row[f"status_{sdet}"] = sm.get("status", "UNKNOWN")
 
             for ckey in comp_fieldnames:
@@ -142,6 +161,48 @@ def write_summary_reports(
     print(f"Flagged outlier runs list written to: {flagged_list_path}")
 
 
+def write_slice_reports(
+    data_list: List[Dict[str, Any]],
+    output_dir: Union[str, Path],
+    subdetectors: Sequence[str] = ("NS", "N", "S"),
+) -> Dict[str, Dict[str, Dict[str, int]]]:
+    """
+    Writes qvec_qa_slices.csv (one row per run, centrality slice and subdetector) and
+    slice_flagged_runs.list (runs with any slice flag, with the flags). Returns
+    counts[slice][subdet][flag] of runs per flag, over runs whose integrated (NS) status is GOOD.
+    """
+    output_dir = Path(output_dir)
+    csv_path = output_dir / "qvec_qa_slices.csv"
+    list_path = output_dir / "slice_flagged_runs.list"
+    counts: Dict[str, Dict[str, Dict[str, int]]] = {}
+
+    fieldnames = ["run_number", "slice", "subdet"] + [k for k, _ in SUBDET_CSV_FIELDS] + ["status", "primary_status"]
+    with open(csv_path, "w", newline="") as f_csv, open(list_path, "w") as f_list:
+        writer = csv.DictWriter(f_csv, fieldnames=fieldnames)
+        writer.writeheader()
+        for d in data_list:
+            for label, slice_subdets in d.get("slices", {}).items():
+                for sdet in subdetectors:
+                    sm = slice_subdets.get(sdet)
+                    if sm is None:
+                        continue
+                    row = {"run_number": d["run_number"], "slice": label, "subdet": sdet,
+                           "status": sm.get("status", "UNKNOWN"), "primary_status": d["primary_status"]}
+                    row.update({k: _fmt(sm.get(k, np.nan), spec) for k, spec in SUBDET_CSV_FIELDS})
+                    writer.writerow(row)
+                    if d["primary_status"] == "GOOD":
+                        for flag in sm.get("status", "GOOD").split(";"):
+                            if flag not in ("GOOD", "FLAG_LOW_STATS", "FLAG_EMPTY_OR_ZERO"):
+                                c = counts.setdefault(label, {}).setdefault(sdet, {})
+                                c[flag] = c.get(flag, 0) + 1
+            if d.get("slice_status", "GOOD") not in ("GOOD", "not evaluated"):
+                f_list.write(f"{d['run_number']}\t{d['slice_status']}\n")
+
+    print(f"Centrality-slice CSV written to: {csv_path}")
+    print(f"Slice-flagged runs list written to: {list_path}")
+    return counts
+
+
 def is_empty_run(d: Dict[str, Any]) -> bool:
     """True if every subdetector of the run is FLAG_EMPTY_OR_ZERO (no events, nothing to plot)."""
     subdets = d.get("subdetectors", {})
@@ -155,9 +216,7 @@ def generate_failure_mode_examples(
     output_dir: Union[str, Path],
     subdet: str = "NS",
     example_runs_per_mode: int = 3,
-    max_rms_pct: float = 2.5,
-    max_chi2: float = 2.0,
-    max_a: float = 1.0,
+    cuts: Optional[Dict[str, float]] = None,
 ) -> Dict[str, List[int]]:
     """
     Identify representative outlier runs for each failure mode and generate
@@ -165,25 +224,27 @@ def generate_failure_mode_examples(
     """
     output_dir = Path(output_dir)
     examples_dir = output_dir / "failure_examples"
+    cuts = cuts or {}
+    max_a = cuts.get("max_a_ns", 0.75) if subdet == "NS" else cuts.get("max_a_arm", 1.0)
 
     failure_modes_config = [
         {
             "mode": "FLAG_HIGH_CHI2",
-            "description": f"High Flatness Chi2/ndf (> {max_chi2})",
+            "description": f"High Flatness Chi2/ndf (> {cuts.get('max_chi2', 2.0):g})",
             "filter_fn": lambda d: "FLAG_HIGH_CHI2" in d.get("subdetectors", {}).get(subdet, {}).get("status", "").split(";"),
             "sort_key": lambda d: d.get("subdetectors", {}).get(subdet, {}).get("chi2_ndf", 0.0),
             "reverse": True,
         },
         {
             "mode": "FLAG_NON_FLAT",
-            "description": f"Excess RMS Non-Flatness (> cut)",
+            "description": "Significant Non-Flatness (RMS or single-bin deviation)",
             "filter_fn": lambda d: "FLAG_NON_FLAT" in d.get("subdetectors", {}).get(subdet, {}).get("status", "").split(";"),
             "sort_key": lambda d: d.get("subdetectors", {}).get(subdet, {}).get("rms_pct", 0.0),
             "reverse": True,
         },
         {
             "mode": "FLAG_RESIDUAL_MODULATION",
-            "description": f"Residual Harmonic Modulation (> {max_a}%)",
+            "description": f"Residual Harmonic Modulation (> {max_a:g}% and significant)",
             "filter_fn": lambda d: "FLAG_RESIDUAL_MODULATION" in d.get("subdetectors", {}).get(subdet, {}).get("status", "").split(";"),
             "sort_key": lambda d: max(
                 d.get("subdetectors", {}).get(subdet, {}).get("A1_pct", 0.0),
@@ -249,8 +310,8 @@ def generate_failure_mode_examples(
             example_runs=[d["run_number"] for d in selected],
             output_path=dist_plot_path,
             subdet=subdet,
-            max_rms_pct=max_rms_pct,
-            max_chi2=max_chi2,
+            rms_cut=cuts.get("max_rms_sigma", 1.3),
+            max_chi2=cuts.get("max_chi2", 2.0),
             max_a=max_a,
         )
 
@@ -305,7 +366,7 @@ def generate_top_flat_examples(
     return selected_run_numbers
 
 
-def explain_arm_flags(arm_label: str, sm: Dict[str, Any], cuts: Dict[str, float]) -> List[str]:
+def explain_arm_flags(arm_label: str, sm: Dict[str, Any], cuts: Dict[str, float], subdet: str) -> List[str]:
     """
     Explain each flag in one arm's status using that arm's own metrics and the cuts it was evaluated with.
     """
@@ -316,13 +377,13 @@ def explain_arm_flags(arm_label: str, sm: Dict[str, Any], cuts: Dict[str, float]
     nevt = sm.get("total_events", 0.0)
     mean_bin = sm.get("mean_bin", 0.0)
     chi2 = sm.get("chi2_ndf", np.nan)
-    rms = sm.get("rms_pct", np.nan)
+    rms_sig = sm.get("rms_sigma", np.nan)
     rms_ex = sm.get("rms_excess_pct", np.nan)
     max_dev = sm.get("max_dev_pct", np.nan)
-    a1 = sm.get("A1_pct", np.nan)
-    a2 = sm.get("A2_pct", np.nan)
-    # Expected statistical fluctuation per Psi bin
-    poisson_pct = 100.0 / np.sqrt(mean_bin) if mean_bin > 0 else np.nan
+    max_dev_sig = sm.get("max_dev_sigma", np.nan)
+    a1, a1_sig = sm.get("A1_pct", np.nan), sm.get("A1_sig", np.nan)
+    a2, a2_sig = sm.get("A2_pct", np.nan), sm.get("A2_sig", np.nan)
+    max_a = cuts["max_a_ns"] if subdet == "NS" else cuts["max_a_arm"]
 
     reasons = []
     for flag in flags:
@@ -334,20 +395,21 @@ def explain_arm_flags(arm_label: str, sm: Dict[str, Any], cuts: Dict[str, float]
             text = f"chi2/ndf vs flat = {chi2:.2f} (cut: {cuts['max_chi2']:g})"
         elif flag == "FLAG_NON_FLAT":
             parts = []
-            if not np.isnan(rms_ex) and rms_ex > cuts["max_excess_rms"]:
-                parts.append(f"excess RMS {rms_ex:.2f}% (cut: {cuts['max_excess_rms']:g}%)")
-            if not np.isnan(rms) and rms > cuts["max_rms"] and not np.isnan(chi2) and chi2 > cuts["max_chi2"]:
-                parts.append(f"RMS {rms:.2f}% (cut: {cuts['max_rms']:g}%) with chi2/ndf {chi2:.2f}")
-            if not np.isnan(max_dev) and max_dev > cuts["max_dev_pct"]:
-                n_sigma = max_dev / poisson_pct if poisson_pct > 0 else np.nan
+            if rms_sig > cuts["max_rms_sigma"] and rms_ex > cuts["max_excess_rms"]:
                 parts.append(
-                    f"max deviation {max_dev:.2f}% (cut: {cuts['max_dev_pct']:g}%), "
-                    f"{n_sigma:.1f} sigma of the ~{poisson_pct:.2f}%/bin Poisson fluctuation (~{mean_bin:,.0f} events/bin)"
+                    f"RMS {rms_sig:.2f}x the Poisson expectation (cut: {cuts['max_rms_sigma']:g}) "
+                    f"with excess RMS {rms_ex:.2f}% (cut: {cuts['max_excess_rms']:g}%)"
+                )
+            if max_dev_sig > cuts["max_dev_sigma"]:
+                parts.append(
+                    f"one bin {max_dev:.2f}% from flat = {max_dev_sig:.1f} Poisson sigma "
+                    f"(cut: {cuts['max_dev_sigma']:g}; ~{mean_bin:,.0f} events/bin)"
                 )
             text = "; ".join(parts) if parts else "non-flat"
             text += f". chi2/ndf {chi2:.2f}, A2 {a2:.2f}%"
         elif flag == "FLAG_RESIDUAL_MODULATION":
-            text = f"A1 {a1:.2f}%, A2 {a2:.2f}% (cut: {cuts['max_a']:g}%)"
+            text = (f"A1 {a1:.2f}% ({a1_sig:.1f} sigma), A2 {a2:.2f}% ({a2_sig:.1f} sigma) "
+                    f"(cut: {max_a:g}% and {cuts['min_a_sig']:g} sigma)")
         else:
             text = ""
         reasons.append(f"**{arm_label}** `{flag}`" + (f": {text}" if text else ""))
@@ -401,8 +463,8 @@ def generate_flagged_arm_examples(
 
         # Explain each arm's flags with its own metrics
         reasons = []
-        for arm_label, sm in [("South Arm (S)", s_s), ("North Arm (N)", n_s), ("Combined (NS)", ns_s)]:
-            reasons.extend(explain_arm_flags(arm_label, sm, cuts))
+        for arm_label, sm, sdet in [("South Arm (S)", s_s, "S"), ("North Arm (N)", n_s, "N"), ("Combined (NS)", ns_s, "NS")]:
+            reasons.extend(explain_arm_flags(arm_label, sm, cuts, sdet))
 
         # A single arm flagged while the combined NS is GOOD usually means the arms' residuals cancel
         if ns_s.get("status") == "GOOD" and (s_s.get("status") != "GOOD" or n_s.get("status") != "GOOD"):
@@ -447,76 +509,49 @@ def generate_flagged_arm_examples(
     return flagged_run_numbers
 
 
-def reevaluate_data_list(
-    data_list: List[Dict[str, Any]],
-    subdetectors: Sequence[str] = ("NS", "N", "S"),
-    min_events: float = 100000.0,
-    max_chi2: float = 2.0,
-    max_rms: float = 3.5,
-    max_excess_rms: float = 2.0,
-    max_dev_pct: float = 12.0,
-    max_a: float = 1.0,
-    max_recent_dev: float = 1e-3,
-    max_twist_dev: float = 1e-3,
-    max_ratio_dev: float = 0.02,
-) -> None:
-    """
-    Re-evaluate QA pass/fail status flags on cached metrics without re-reading ROOT files.
-    """
+def reevaluate_data_list(data_list: List[Dict[str, Any]], cuts: Dict[str, float]) -> None:
+    """Re-evaluates all QA statuses of cached run records with the current cuts, without re-reading ROOT files."""
     for d in data_list:
-        subdets = d.get("subdetectors", {})
-        for sdet, sm in subdets.items():
-            sm["status"] = evaluate_subdet_status(
-                sm,
-                min_events=min_events,
-                max_chi2=max_chi2,
-                max_rms=max_rms,
-                max_excess_rms=max_excess_rms,
-                max_dev_pct=max_dev_pct,
-                max_a1=max_a,
-                max_a2=max_a,
-            )
-        primary_status = subdets.get("NS", {}).get("status", "UNKNOWN")
-        all_flags = []
-        for sdet, sm in subdets.items():
-            st = sm.get("status", "UNKNOWN")
-            if st != "GOOD":
-                for flag in st.split(";"):
-                    entry = f"{flag}_{sdet}" if len(subdetectors) > 1 else flag
-                    if entry not in all_flags:
-                        all_flags.append(entry)
+        evaluate_run(d, cuts)
 
-        # Check component flags if present
-        for sdet in ["N", "S"]:
-            qx_max = d.get(f"Q_{sdet}_x_max_abs", np.nan)
-            qy_max = d.get(f"Q_{sdet}_y_max_abs", np.nan)
-            if not np.isnan(qx_max) and qx_max > max_recent_dev:
-                f_name = f"FLAG_RECENT_NONZERO_{sdet}"
-                if f_name not in all_flags:
-                    all_flags.append(f_name)
-            if not np.isnan(qy_max) and qy_max > max_recent_dev:
-                f_name = f"FLAG_RECENT_NONZERO_{sdet}"
-                if f_name not in all_flags:
-                    all_flags.append(f_name)
 
-        for sdet in ["N", "S", "NS"]:
-            qxy_max = d.get(f"Q_{sdet}_xy_max_abs", np.nan)
-            if not np.isnan(qxy_max) and qxy_max > max_twist_dev:
-                f_name = f"FLAG_TWIST_NONZERO_{sdet}"
-                if f_name not in all_flags:
-                    all_flags.append(f_name)
+def extract_runs(
+    file_paths: Sequence[str],
+    args: argparse.Namespace,
+    cuts: Dict[str, float],
+    cent_slices: Sequence[tuple],
+) -> List[Dict[str, Any]]:
+    """Reads the QA metrics of every file in parallel, sorted by run number."""
+    extract_fn = functools.partial(
+        extract_qvec_run_metrics,
+        subdetectors=("NS", "N", "S"),
+        harmonic=args.harmonic,
+        pass_suffix="_corr2",
+        cent_min=args.cent_min,
+        cent_max=args.cent_max,
+        cent_slices=cent_slices,
+        check_components=not args.no_components,
+        cuts=cuts,
+    )
 
-            xxyy_dev = d.get(f"Q_{sdet}_xxyy_max_dev", np.nan)
-            if not np.isnan(xxyy_dev) and xxyy_dev > max_ratio_dev:
-                f_name = f"FLAG_FLAT_ECCENTRICITY_{sdet}"
-                if f_name not in all_flags:
-                    all_flags.append(f_name)
+    data_list: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(extract_fn, fp): fp for fp in file_paths}
+        for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Extracting Metrics"):
+            res, err = future.result()
+            if res is not None:
+                data_list.append(res)
+            else:
+                errors.append(err or "Unknown error")
 
-        overall_status = ";".join(sorted(all_flags)) if all_flags else "GOOD"
-        d["primary_status"] = primary_status
-        d["status"] = overall_status
-        if "NS" in subdets:
-            d["total_events"] = subdets["NS"].get("total_events", d.get("total_events", 0.0))
+    if errors:
+        print(f"Warning: {len(errors)} files failed to process. First 5 errors:")
+        for e in errors[:5]:
+            print(f"  - {e}")
+
+    data_list.sort(key=lambda d: d["run_number"])
+    return data_list
 
 
 def main():
@@ -570,73 +605,18 @@ def main():
         help="Specific run numbers to highlight on plots.",
     )
 
-    # QA Cut Thresholds
-    parser.add_argument(
-        "--min-events",
-        type=float,
-        default=100000.0,
-        help="Minimum events threshold per run (default: 100,000).",
-    )
-    parser.add_argument(
-        "--max-chi2",
-        type=float,
-        default=2.0,
-        help="Maximum chi2/ndf threshold against flat hypothesis (default: 2.0).",
-    )
-    parser.add_argument(
-        "--max-rms",
-        type=float,
-        default=3.5,
-        help="Maximum total RMS non-flatness [%%] cut line (default: 3.5%%).",
-    )
-    parser.add_argument(
-        "--max-excess-rms",
-        type=float,
-        default=2.0,
-        help="Maximum excess (statistical-subtracted) RMS [%%] cut (default: 2.0%%).",
-    )
-    parser.add_argument(
-        "--max-dev",
-        type=float,
-        default=12.0,
-        help="Maximum relative peak/trough deviation [%%] cut (default: 12.0%%).",
-    )
-    parser.add_argument(
-        "--max-a",
-        type=float,
-        default=1.0,
-        help="Maximum Fourier harmonic amplitude [%%] for A1 and A2 (default: 1.0%%).",
-    )
+    # QA cut thresholds (shared with plot_qvec_run.py)
+    add_cut_args(parser)
     parser.add_argument(
         "--top-flat-examples",
         type=int,
         default=3,
         help="Number of representative top flattest runs to save for reference (default: 3).",
     )
-
-    # Component Calibration Checks
     parser.add_argument(
         "--no-components",
         action="store_true",
         help="Disable intermediate Q-vector component QA checks (recentering, twisting, variance ratio).",
-    )
-    parser.add_argument(
-        "--max-recent-dev",
-        type=float,
-        default=1e-3,
-        help="Maximum deviation for <Qx> and <Qy> recentering (default: 1e-3).",
-    )
-    parser.add_argument(
-        "--max-twist-dev",
-        type=float,
-        default=1e-3,
-        help="Maximum deviation for <Qxy> twisting (default: 1e-3).",
-    )
-    parser.add_argument(
-        "--max-ratio-dev",
-        type=float,
-        default=0.02,
-        help="Maximum deviation from 1.0 for <Qxx>/<Qyy> ratio (default: 0.02).",
     )
 
     # Caching options
@@ -657,18 +637,26 @@ def main():
         help="Force re-reading of input ROOT files even if cache exists.",
     )
 
-    # Centrality Slicing
+    # Centrality
     parser.add_argument(
         "--cent-min",
         type=float,
         default=None,
-        help="Minimum centrality [%%] for projection slice (default: all).",
+        help="Minimum centrality [%%] of the main (integrated) projection (default: all).",
     )
     parser.add_argument(
         "--cent-max",
         type=float,
         default=None,
-        help="Maximum centrality [%%] for projection slice (default: all).",
+        help="Maximum centrality [%%] of the main (integrated) projection (default: all).",
+    )
+    parser.add_argument(
+        "--cent-slices",
+        type=str,
+        default=",".join(slice_label(s) for s in DEFAULT_CENT_SLICES),
+        help="Centrality slices [%%] evaluated in addition to the integrated distribution, e.g. '0-20,60-80'; "
+             "'none' to disable. Slice flags are reported (qvec_qa_slices.csv, slice_flagged_runs.list) but do not "
+             f"change the good-run list. Default: {','.join(slice_label(s) for s in DEFAULT_CENT_SLICES)}.",
     )
 
     parser.add_argument(
@@ -679,6 +667,9 @@ def main():
     )
 
     args = parser.parse_args()
+    cuts = cuts_from_args(args)
+    cent_slices = parse_cent_slices(args.cent_slices)
+    slice_labels = [slice_label(s) for s in cent_slices]
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -688,39 +679,36 @@ def main():
     use_cache = args.cache or (args.cache_file is not None)
     cache_path = Path(args.cache_file) if args.cache_file else (output_dir / "qvec_qa_cache.pkl")
 
-    loaded_from_cache = False
-    data_list: List[Dict[str, Any]] = []
+    print(f"============================================================")
+    print(f"  sEPD Q-Vector Run-by-Run QA Aggregate Suite")
+    print(f"  Output directory: {output_dir}")
+    print(f"  Cuts: " + ", ".join(f"{k}={v:g}" for k, v in cuts.items()))
+    print(f"  Centrality slices: {', '.join(slice_labels) if slice_labels else 'none'}")
+    print(f"============================================================")
 
+    data_list: List[Dict[str, Any]] = []
+    loaded_from_cache = False
     if use_cache and cache_path.exists() and not args.force_reload:
-        print(f"============================================================")
-        print(f"  sEPD Q-Vector Run-by-Run QA Aggregate Suite")
-        print(f"  Loading cached metrics from: {cache_path}")
-        print(f"  Output directory: {output_dir}")
-        print(f"============================================================")
+        print(f"Loading cached metrics from: {cache_path}")
         try:
             with open(cache_path, "rb") as f_pkl:
                 data_list = pickle.load(f_pkl)
             print(f"Successfully loaded {len(data_list):,} runs from cache.")
             loaded_from_cache = True
-            # Re-evaluate statuses using current thresholds
-            reevaluate_data_list(
-                data_list,
-                subdetectors=subdetectors,
-                min_events=args.min_events,
-                max_chi2=args.max_chi2,
-                max_rms=args.max_rms,
-                max_excess_rms=args.max_excess_rms,
-                max_dev_pct=args.max_dev,
-                max_a=args.max_a,
-                max_recent_dev=args.max_recent_dev,
-                max_twist_dev=args.max_twist_dev,
-                max_ratio_dev=args.max_ratio_dev,
-            )
         except Exception as e:
             print(f"Warning: Failed to load cache from {cache_path}: {e}. Falling back to ROOT files.")
-            loaded_from_cache = False
 
-    if not loaded_from_cache:
+    if loaded_from_cache:
+        cached_slices = set(data_list[0].get("slices", {}).keys()) if data_list else set()
+        if not set(slice_labels) <= cached_slices:
+            # The cache predates (or uses other) centrality slices: re-read the files it lists
+            print(f"Cache has centrality slices {sorted(cached_slices) or 'none'}; re-reading the "
+                  f"{len(data_list):,} cached files for slices {slice_labels}.")
+            data_list = extract_runs([d["file_path"] for d in data_list], args, cuts, cent_slices)
+            loaded_from_cache = False
+        else:
+            reevaluate_data_list(data_list, cuts)
+    else:
         file_paths: List[str] = []
         if args.file_list:
             list_path = Path(args.file_list)
@@ -735,65 +723,19 @@ def main():
             print(f"Error: No inputs specified. Provide --file-list, --files, or specify an existing --cache-file.")
             sys.exit(1)
 
-        print(f"============================================================")
-        print(f"  sEPD Q-Vector Run-by-Run QA Aggregate Suite")
-        print(f"  Total input files: {len(file_paths):,}")
-        print(f"  Harmonic: {args.harmonic}")
-        print(f"  Parallel workers: {args.workers}")
-        print(f"  Output directory: {output_dir}")
-        if use_cache:
-            print(f"  Pickle cache:     {cache_path} (will be created)")
-        print(f"============================================================")
+        print(f"  Total input files: {len(file_paths):,} | Harmonic: {args.harmonic} | Parallel workers: {args.workers}")
+        data_list = extract_runs(file_paths, args, cuts, cent_slices)
 
-        extract_fn = functools.partial(
-            extract_qvec_run_metrics,
-            subdetectors=subdetectors,
-            harmonic=args.harmonic,
-            pass_suffix="_corr2",
-            cent_min=args.cent_min,
-            cent_max=args.cent_max,
-            min_events=args.min_events,
-            max_chi2=args.max_chi2,
-            max_rms=args.max_rms,
-            max_excess_rms=args.max_excess_rms,
-            max_dev_pct=args.max_dev,
-            max_a1=args.max_a,
-            max_a2=args.max_a,
-            check_components=not args.no_components,
-            max_recent_dev=args.max_recent_dev,
-            max_twist_dev=args.max_twist_dev,
-            max_ratio_dev=args.max_ratio_dev,
-        )
+    if not data_list:
+        print("Error: No valid run data extracted.")
+        sys.exit(1)
 
-        errors: List[str] = []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {executor.submit(extract_fn, fp): fp for fp in file_paths}
-            for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Extracting Metrics"):
-                res, err = future.result()
-                if res is not None:
-                    data_list.append(res)
-                else:
-                    errors.append(err or "Unknown error")
-
-        if errors:
-            print(f"Warning: {len(errors)} files failed to process. First 5 errors:")
-            for e in errors[:5]:
-                print(f"  - {e}")
-
-        if not data_list:
-            print("Error: No valid run data extracted.")
-            sys.exit(1)
-
-        # Sort sequentially by run number
-        data_list.sort(key=lambda d: d["run_number"])
-
-        if use_cache:
-            print(f"\nSaving {len(data_list):,} runs to pickle cache: {cache_path} ...")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, "wb") as f_pkl:
-                pickle.dump(data_list, f_pkl, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"Cache saved successfully ({cache_path.stat().st_size / (1024*1024):.1f} MB).")
+    if use_cache and not loaded_from_cache:
+        print(f"\nSaving {len(data_list):,} runs to pickle cache: {cache_path} ...")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f_pkl:
+            pickle.dump(data_list, f_pkl, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Cache saved successfully ({cache_path.stat().st_size / (1024*1024):.1f} MB).")
 
     # 1. Summary CSV and Run Lists
     write_summary_reports(data_list, output_dir, subdetectors=subdetectors)
@@ -807,6 +749,21 @@ def main():
     print(f"  Good runs (NS):      {good_runs:,} ({100.0 * good_runs / total_runs:.1f}%)")
     print(f"  Flagged runs (NS):   {flagged_runs:,} ({100.0 * flagged_runs / total_runs:.1f}%)")
 
+    # Centrality slices: reported, but do not change the good-run list
+    if slice_labels:
+        slice_counts = write_slice_reports(data_list, output_dir, subdetectors=subdetectors)
+        n_slice_flagged = sum(1 for d in data_list if d["primary_status"] == "GOOD" and d.get("slice_status", "GOOD") != "GOOD")
+        print(f"\nCentrality slices (good runs only; FLAG_LOW_STATS not counted):")
+        print(f"  Good runs with any slice flag: {n_slice_flagged:,}")
+        for label in slice_labels:
+            for sdet in subdetectors:
+                c = slice_counts.get(label, {}).get(sdet, {})
+                if c:
+                    print(f"  {label:>6} {sdet:<2}: " + ", ".join(f"{k.replace('FLAG_', '')} {v}" for k, v in sorted(c.items())))
+        slice_plot = output_dir / "slices_summary.png"
+        plot_slice_summary(data_list, slice_plot, slice_labels=slice_labels, cuts=cuts)
+        print(f"  - Slice summary plot saved: {slice_plot.name}")
+
     # 2. Determine which subdetectors to plot
     plots_subdets = ["NS"] if args.subdetector == "NS" else (["N"] if args.subdetector == "N" else (["S"] if args.subdetector == "S" else ["NS", "N", "S"]))
 
@@ -817,6 +774,7 @@ def main():
     # 4. Generate Aggregate Plots
     for sdet in plots_subdets:
         print(f"\nGenerating publication plots for subdetector: {sdet}...")
+        max_a = cuts["max_a_ns"] if sdet == "NS" else cuts["max_a_arm"]
 
         # 2D Heatmap
         heatmap_path = output_dir / f"heatmap_psi2_{sdet}.png"
@@ -830,37 +788,27 @@ def main():
             trends_path,
             subdet=sdet,
             test_runs=args.test_runs,
-            max_rms_pct=args.max_rms,
-            max_chi2=args.max_chi2,
-            max_a=args.max_a,
-            min_events=args.min_events,
+            rms_cut=cuts["max_rms_sigma"],
+            max_chi2=cuts["max_chi2"],
+            max_a=max_a,
+            min_events=cuts["min_events"],
             save_individual=True,
         )
         print(f"  - Trend plots saved: {trends_path.name}")
 
         # Metric distribution histograms (saved in dedicated metric_distributions/ subfolder with individual plots)
-        dist_path = dist_dir / f"metric_distributions_4panel_{sdet}.png"
-        plot_metric_distributions(
-            data_list,
-            dist_path,
-            subdet=sdet,
-            max_rms_pct=args.max_rms,
-            max_chi2=args.max_chi2,
-            max_a=args.max_a,
-            min_events=args.min_events,
-            save_individual=True,
-        )
-        # Also save 4-panel at top-level for convenience
-        plot_metric_distributions(
-            data_list,
-            output_dir / f"metric_distributions_psi2_{sdet}.png",
-            subdet=sdet,
-            max_rms_pct=args.max_rms,
-            max_chi2=args.max_chi2,
-            max_a=args.max_a,
-            min_events=args.min_events,
-            save_individual=False,
-        )
+        for path, individual in [(dist_dir / f"metric_distributions_4panel_{sdet}.png", True),
+                                 (output_dir / f"metric_distributions_psi2_{sdet}.png", False)]:
+            plot_metric_distributions(
+                data_list,
+                path,
+                subdet=sdet,
+                rms_cut=cuts["max_rms_sigma"],
+                max_chi2=cuts["max_chi2"],
+                max_a=max_a,
+                min_events=cuts["min_events"],
+                save_individual=individual,
+            )
         print(f"  - Metric distributions saved in {dist_dir.name}/")
 
         # Ensemble Flatness Profile
@@ -870,12 +818,19 @@ def main():
 
     # 5. Generate 1x3 side-by-side metric comparisons (S vs N vs NS) in metric_distributions/
     print(f"\nGenerating 1x3 side-by-side metric comparison plots (S vs N vs NS)...")
-    plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_rms.png", metric_type="rms", max_rms_pct=args.max_rms, zoomed=False)
-    plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_rms_zoomed.png", metric_type="rms", max_rms_pct=args.max_rms, zoomed=True)
-    plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_chi2.png", metric_type="chi2", max_chi2=args.max_chi2, zoomed=False)
-    plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_chi2_zoomed.png", metric_type="chi2", max_chi2=args.max_chi2, zoomed=True)
-    plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_modulation.png", metric_type="modulation", max_a=args.max_a, zoomed=False)
-    plot_metric_comparison_1x3(data_list, dist_dir / "comparison_1x3_modulation_zoomed.png", metric_type="modulation", max_a=args.max_a, zoomed=True)
+    for metric_type in ("rms", "chi2", "modulation"):
+        for zoomed in (False, True):
+            suffix = "_zoomed" if zoomed else ""
+            plot_metric_comparison_1x3(
+                data_list,
+                dist_dir / f"comparison_1x3_{metric_type}{suffix}.png",
+                metric_type=metric_type,
+                rms_cut=cuts["max_rms_sigma"],
+                max_chi2=cuts["max_chi2"],
+                max_a=cuts["max_a_arm"],
+                max_a_ns=cuts["max_a_ns"],
+                zoomed=zoomed,
+            )
     print(f"  - 1x3 Comparison plots saved in {dist_dir.name}/")
 
     # 6. Generate Q-vector component QA trends (recentering & flattening)
@@ -885,9 +840,9 @@ def main():
         plot_components_trends(
             data_list,
             output_dir,
-            max_recent_dev=args.max_recent_dev,
-            max_twist_dev=args.max_twist_dev,
-            max_ratio_dev=args.max_ratio_dev,
+            max_recent_dev=cuts["max_recent_dev"],
+            max_twist_dev=cuts["max_twist_dev"],
+            max_ratio_dev=cuts["max_ratio_dev"],
         )
         print(f"  - Component trend plots saved: trends_components_recentering.png, trends_components_flattening.png")
 
@@ -902,39 +857,26 @@ def main():
         )
         print(f"  - Top flat runs saved: {top_runs}")
 
-    # 7. Generate Flagged Arm Runs Diagnostics (dedicated folder for any runs with flagged detector arms)
+    # 8. Generate Flagged Arm Runs Diagnostics (dedicated folder for any runs with flagged detector arms)
     print(f"\nIdentifying runs with flagged detector arms and generating diagnostic plots...")
-    flagged_arm_runs = generate_flagged_arm_examples(
-        data_list,
-        output_dir,
-        cuts={
-            "min_events": args.min_events,
-            "max_chi2": args.max_chi2,
-            "max_rms": args.max_rms,
-            "max_excess_rms": args.max_excess_rms,
-            "max_dev_pct": args.max_dev,
-            "max_a": args.max_a,
-        },
-    )
+    flagged_arm_runs = generate_flagged_arm_examples(data_list, output_dir, cuts=cuts)
     print(f"  - Flagged arm runs saved in flagged_arm_runs/: {flagged_arm_runs}")
 
-    # 8. Generate Failure Mode Galleries for primary subdetector (NS)
+    # 9. Generate Failure Mode Galleries for primary subdetector (NS)
     print(f"\nSelecting representative failure mode examples and generating gallery...")
     examples_map = generate_failure_mode_examples(
         data_list,
         output_dir,
         subdet="NS",
         example_runs_per_mode=args.example_runs_per_mode,
-        max_rms_pct=args.max_rms,
-        max_chi2=args.max_chi2,
-        max_a=args.max_a,
+        cuts=cuts,
     )
 
     for mode, runs in examples_map.items():
         if runs:
             print(f"  - {mode}: runs {runs}")
 
-    # 5. Diagnostic plots for user-specified test runs
+    # 10. Diagnostic plots for user-specified test runs
     if args.test_runs:
         test_dir = output_dir / "test_runs"
         test_dir.mkdir(parents=True, exist_ok=True)

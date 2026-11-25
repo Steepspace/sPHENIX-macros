@@ -18,7 +18,7 @@ script_dir = Path(__file__).resolve().parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
-from qvec_qa_metrics import extract_qvec_run_metrics
+from qvec_qa_metrics import add_cut_args, cuts_from_args, extract_qvec_run_metrics
 from qvec_qa_plots import plot_diagnostic_run, plot_qvec_components_diagnostic
 
 
@@ -30,7 +30,8 @@ def print_run_summary_table(metric_record: dict) -> None:
     print(f"  sEPD Q-Vector Run QA Diagnostic: Run {run_number} | Overall Status: {status}")
     print(f"  File: {metric_record['file_path']}")
     print(f"==========================================================================================")
-    header = f"{'Arm':<6} | {'Events':<10} | {'Chi2/ndf':<9} | {'RMS (%)':<8} | {'Excess RMS':<11} | {'MaxDev (%)':<10} | {'A1 (%)':<7} | {'A2 (%)':<7} | {'Status'}"
+    header = (f"{'Arm':<6} | {'Events':<10} | {'Chi2/ndf':<9} | {'RMS [sig]':<9} | {'Excess RMS':<11} | "
+              f"{'MaxDev [sig]':<12} | {'A1 % (sig)':<12} | {'A2 % (sig)':<12} | {'Status'}")
     print(header)
     print("-" * len(header))
 
@@ -39,14 +40,14 @@ def print_run_summary_table(metric_record: dict) -> None:
         sm = metric_record.get("subdetectors", {}).get(sdet, {})
         evts = f"{sm.get('total_events', 0):,.0f}"
         chi2 = f"{sm.get('chi2_ndf', float('nan')):.3f}"
-        rms = f"{sm.get('rms_pct', float('nan')):.2f}%"
+        rms = f"{sm.get('rms_sigma', float('nan')):.2f}"
         exc = f"{sm.get('rms_excess_pct', float('nan')):.2f}%"
-        mdev = f"{sm.get('max_dev_pct', float('nan')):.2f}%"
-        a1 = f"{sm.get('A1_pct', float('nan')):.2f}%"
-        a2 = f"{sm.get('A2_pct', float('nan')):.2f}%"
+        mdev = f"{sm.get('max_dev_sigma', float('nan')):.2f}"
+        a1 = f"{sm.get('A1_pct', float('nan')):.2f} ({sm.get('A1_sig', float('nan')):.1f})"
+        a2 = f"{sm.get('A2_pct', float('nan')):.2f} ({sm.get('A2_sig', float('nan')):.1f})"
         st = sm.get("status", "UNKNOWN")
 
-        print(f"{sdet:<6} | {evts:<10} | {chi2:<9} | {rms:<8} | {exc:<11} | {mdev:<10} | {a1:<7} | {a2:<7} | {st}")
+        print(f"{sdet:<6} | {evts:<10} | {chi2:<9} | {rms:<9} | {exc:<11} | {mdev:<12} | {a1:<12} | {a2:<12} | {st}")
     print("------------------------------------------------------------------------------------------")
 
     # Intermediate Q-vector Component Calibration Checks
@@ -95,42 +96,7 @@ def main():
         default=2,
         help="Harmonic order n (default: 2).",
     )
-    parser.add_argument(
-        "--min-events",
-        type=float,
-        default=100000.0,
-        help="Minimum events threshold (default: 100,000).",
-    )
-    parser.add_argument(
-        "--max-chi2",
-        type=float,
-        default=2.0,
-        help="Maximum chi2/ndf threshold (default: 2.0).",
-    )
-    parser.add_argument(
-        "--max-rms",
-        type=float,
-        default=3.5,
-        help="Maximum total RMS non-flatness [%%] threshold (default: 3.5%%).",
-    )
-    parser.add_argument(
-        "--max-excess-rms",
-        type=float,
-        default=2.0,
-        help="Maximum excess RMS threshold [%%] (default: 2.0%%).",
-    )
-    parser.add_argument(
-        "--max-dev",
-        type=float,
-        default=12.0,
-        help="Maximum relative peak/trough deviation [%%] (default: 12.0%%).",
-    )
-    parser.add_argument(
-        "--max-a",
-        type=float,
-        default=1.0,
-        help="Maximum Fourier modulation amplitude [%%] (default: 1.0%%).",
-    )
+    add_cut_args(parser)
     parser.add_argument(
         "--cent-min",
         type=float,
@@ -159,13 +125,7 @@ def main():
             pass_suffix="_corr2",
             cent_min=args.cent_min,
             cent_max=args.cent_max,
-            min_events=args.min_events,
-            max_chi2=args.max_chi2,
-            max_rms=args.max_rms,
-            max_excess_rms=args.max_excess_rms,
-            max_dev_pct=args.max_dev,
-            max_a1=args.max_a,
-            max_a2=args.max_a,
+            cuts=cuts_from_args(args),
         )
 
         if err or res is None:

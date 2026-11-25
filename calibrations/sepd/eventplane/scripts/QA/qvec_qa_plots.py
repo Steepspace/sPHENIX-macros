@@ -147,7 +147,7 @@ def plot_heatmap(
 # 2. 4-PANEL TREND PLOTS VS RUN NUMBER
 # ==============================================================================
 
-def _draw_rms_scatter(ax, runs, rms_vals, is_good, is_outlier, is_test, max_rms_pct, s_good=28, s_bad=42):
+def _draw_rms_scatter(ax, runs, rms_vals, is_good, is_outlier, is_test, rms_cut, s_good=28, s_bad=42):
     ax.scatter(runs[is_good], rms_vals[is_good], color="forestgreen", s=s_good, alpha=0.7, label="Good Runs", edgecolors="none")
     ax.scatter(runs[is_outlier], rms_vals[is_outlier], color="crimson", s=s_bad, alpha=0.85, marker="^", label="Flagged Runs")
     if np.any(is_test):
@@ -155,7 +155,7 @@ def _draw_rms_scatter(ax, runs, rms_vals, is_good, is_outlier, is_test, max_rms_
         for r, val in zip(runs[is_test], rms_vals[is_test]):
             if not np.isnan(val):
                 ax.annotate(f"{r}", (r, val), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=10, fontweight="bold")
-    ax.axhline(max_rms_pct, color="crimson", linestyle="--", linewidth=1.8, label=rf"Cut ({max_rms_pct:.1f}%)")
+    ax.axhline(rms_cut, color="crimson", linestyle="--", linewidth=1.8, label=rf"Cut ({rms_cut:g})")
     ax.set_ylim(bottom=0.0)
     ax.grid(True, linestyle="--", alpha=0.35)
 
@@ -177,7 +177,7 @@ def _draw_chi2_scatter(ax, runs, chi2_vals, is_good, is_outlier, is_test, max_ch
 def _draw_modulations_scatter(ax, runs, a1_vals, a2_vals, max_a, s=28):
     ax.scatter(runs, a1_vals, color="royalblue", s=s, alpha=0.6, marker="o", label=r"$A_1$ (Dipole Residual)")
     ax.scatter(runs, a2_vals, color="mediumvioletred", s=s, alpha=0.6, marker="s", label=r"$A_2$ (Quadrupole Residual)")
-    ax.axhline(max_a, color="crimson", linestyle="--", linewidth=1.8, label=rf"Cut ({max_a:.1f}%)")
+    ax.axhline(max_a, color="crimson", linestyle="--", linewidth=1.8, label=rf"Cut ({max_a:g}%)")
     ax.set_ylim(bottom=0.0, top=max(1.5, max_a * 1.5))
     ax.grid(True, linestyle="--", alpha=0.35)
 
@@ -200,7 +200,7 @@ def plot_trends(
     output_path: Union[str, Path],
     subdet: str = "NS",
     test_runs: Optional[Sequence[int]] = None,
-    max_rms_pct: float = 3.5,
+    rms_cut: float = 3.5,
     max_chi2: float = 2.0,
     max_a: float = 1.0,
     min_events: float = 100000.0,
@@ -216,7 +216,7 @@ def plot_trends(
     runs = np.array([d["run_number"] for d in data_list])
     m_list = [_get_subdet_metric(d, subdet) for d in data_list]
 
-    rms_vals = np.array([m.get("rms_pct", np.nan) for m in m_list])
+    rms_vals = np.array([m.get("rms_sigma", np.nan) for m in m_list])
     chi2_vals = np.array([m.get("chi2_ndf", np.nan) for m in m_list])
     a1_vals = np.array([m.get("A1_pct", np.nan) for m in m_list])
     a2_vals = np.array([m.get("A2_pct", np.nan) for m in m_list])
@@ -234,8 +234,8 @@ def plot_trends(
     # 4-panel canvas
     fig, axes = plt.subplots(4, 1, figsize=(13, 16), sharex=True)
 
-    _draw_rms_scatter(axes[0], runs, rms_vals, is_good, is_outlier, is_test, max_rms_pct)
-    axes[0].set_ylabel(rf"{subdet} RMS Non-Flatness [%]", fontsize=13)
+    _draw_rms_scatter(axes[0], runs, rms_vals, is_good, is_outlier, is_test, rms_cut)
+    axes[0].set_ylabel(rf"{subdet} RMS / Poisson Expectation", fontsize=13)
     axes[0].legend(loc="upper right", ncol=3, fontsize=11, frameon=True, framealpha=0.9)
 
     _draw_chi2_scatter(axes[1], runs, chi2_vals, is_good, is_outlier, is_test, max_chi2)
@@ -262,9 +262,9 @@ def plot_trends(
 
         # 1. RMS
         fig_r, ax_r = plt.subplots(figsize=(11, 6.5))
-        _draw_rms_scatter(ax_r, runs, rms_vals, is_good, is_outlier, is_test, max_rms_pct, s_good=32, s_bad=48)
+        _draw_rms_scatter(ax_r, runs, rms_vals, is_good, is_outlier, is_test, rms_cut, s_good=32, s_bad=48)
         ax_r.set_xlabel("Run Number", loc="center", fontsize=15)
-        ax_r.set_ylabel(rf"{subdet} RMS Non-Flatness [%]", fontsize=14)
+        ax_r.set_ylabel(rf"{subdet} RMS / Poisson Expectation", fontsize=14)
         ax_r.legend(loc="upper right", ncol=3, fontsize=11, frameon=True, framealpha=0.9)
         fig_r.tight_layout()
         fig_r.savefig(parent / f"{stem}_rms.png", dpi=300, bbox_inches="tight")
@@ -305,9 +305,9 @@ def plot_trends(
 # 3. METRIC DISTRIBUTION HISTOGRAMS
 # ==============================================================================
 
-def _draw_rms_hist(ax, rms_vals, max_rms_pct, zoomed=False, title_font=9.5):
+def _draw_rms_hist(ax, rms_vals, rms_cut, zoomed=False, title_font=9.5):
     if len(rms_vals) > 0:
-        n_pass = sum(1 for v in rms_vals if v <= max_rms_pct)
+        n_pass = sum(1 for v in rms_vals if v <= rms_cut)
         n_fail = len(rms_vals) - n_pass
         pct_pass = 100.0 * n_pass / len(rms_vals)
         pct_fail = 100.0 * n_fail / len(rms_vals)
@@ -316,21 +316,22 @@ def _draw_rms_hist(ax, rms_vals, max_rms_pct, zoomed=False, title_font=9.5):
             x_max = 2.0
             data = np.clip(rms_vals, 0, x_max)
             bins = np.linspace(0, x_max, 40)
-            extra_txt = f"\n(Clipped at {x_max:.1f}%)"
+            extra_txt = f"\n(Clipped at {x_max:.1f})"
         else:
             data = rms_vals
-            x_max = max(max_rms_pct * 1.05, max(rms_vals) * 1.05) if len(rms_vals) else max_rms_pct * 1.1
+            x_max = max(rms_cut * 1.05, max(rms_vals) * 1.05) if len(rms_vals) else rms_cut * 1.1
             bins = np.linspace(0, x_max, 45)
-            extra_txt = f"\nMax RMS: {max(rms_vals):.2f}%"
+            extra_txt = f"\nMax: {max(rms_vals):.2f}"
 
         ax.hist(data, bins=bins, histtype="step", color="steelblue", linewidth=2.0, label="Runs")
-        if max_rms_pct <= x_max:
-            ax.axvline(max_rms_pct, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({max_rms_pct:.1f}%)")
+        if rms_cut <= x_max:
+            ax.axvline(rms_cut, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({rms_cut:g})")
         ax.legend(loc="upper right", bbox_to_anchor=(0.97, 0.97), fontsize=title_font, frameon=True, framealpha=0.92)
 
         box_text = (
-            rf"Pass ($\leq {max_rms_pct}\%$): {n_pass:,} ({pct_pass:.1f}%)" + "\n" +
-            rf"Fail (> {max_rms_pct}%): {n_fail:,} ({pct_fail:.1f}%)" + extra_txt
+            rf"$\leq {rms_cut:g}$: {n_pass:,} ({pct_pass:.1f}%)" + "\n" +
+            rf"$> {rms_cut:g}$: {n_fail:,} ({pct_fail:.1f}%)" + "\n" +
+            "(NON_FLAT also needs excess RMS)" + extra_txt
         )
         ax.text(0.97, 0.76, box_text, transform=ax.transAxes, ha="right", va="top", fontsize=title_font,
                 bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="gray", alpha=0.92))
@@ -394,14 +395,15 @@ def _draw_modulations_hist(ax, a1_vals, a2_vals, max_a, zoomed=False, title_font
         ax.hist(d1, bins=bins, histtype="step", color="royalblue", linewidth=2.0, label=r"$A_1$ (Dipole)")
         ax.hist(d2, bins=bins, histtype="step", color="mediumvioletred", linewidth=2.0, label=r"$A_2$ (Quadrupole)")
         if max_a <= x_max:
-            ax.axvline(max_a, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({max_a:.1f}%)")
+            ax.axvline(max_a, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({max_a:g}%)")
         ax.legend(loc="upper right", bbox_to_anchor=(0.97, 0.97), fontsize=title_font, frameon=True, framealpha=0.92)
 
         n_fail = sum(1 for v1, v2 in zip(a1_vals, a2_vals) if v1 > max_a or v2 > max_a)
         pct_fail = 100.0 * n_fail / len(a1_vals)
 
         box_text = (
-            rf"Fail ($A_1$ or $A_2 > {max_a}\%$): {n_fail:,} ({pct_fail:.1f}%)" + extra_txt
+            rf"$A_1$ or $A_2 > {max_a:g}\%$: {n_fail:,} ({pct_fail:.1f}%)" + "\n" +
+            "(flag also needs significance)" + extra_txt
         )
         ax.text(0.97, 0.68, box_text, transform=ax.transAxes, ha="right", va="top", fontsize=title_font,
                 bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="gray", alpha=0.92))
@@ -441,7 +443,7 @@ def plot_metric_distributions(
     data_list: Sequence[Dict[str, Any]],
     output_path: Union[str, Path],
     subdet: str = "NS",
-    max_rms_pct: float = 3.5,
+    rms_cut: float = 3.5,
     max_chi2: float = 2.0,
     max_a: float = 1.0,
     min_events: float = 100000.0,
@@ -456,7 +458,7 @@ def plot_metric_distributions(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     m_list = [_get_subdet_metric(d, subdet) for d in data_list]
-    rms_vals = [m["rms_pct"] for m in m_list if not np.isnan(m.get("rms_pct", np.nan))]
+    rms_vals = [m["rms_sigma"] for m in m_list if not np.isnan(m.get("rms_sigma", np.nan))]
     chi2_vals = [m["chi2_ndf"] for m in m_list if not np.isnan(m.get("chi2_ndf", np.nan))]
     a1_vals = [m["A1_pct"] for m in m_list if not np.isnan(m.get("A1_pct", np.nan))]
     a2_vals = [m["A2_pct"] for m in m_list if not np.isnan(m.get("A2_pct", np.nan))]
@@ -465,8 +467,8 @@ def plot_metric_distributions(
     # 1. Unzoomed 4-panel
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    _draw_rms_hist(axes[0, 0], rms_vals, max_rms_pct, zoomed=False)
-    axes[0, 0].set_xlabel(rf"{subdet} RMS Non-Flatness [%]")
+    _draw_rms_hist(axes[0, 0], rms_vals, rms_cut, zoomed=False)
+    axes[0, 0].set_xlabel(rf"{subdet} RMS / Poisson Expectation")
     axes[0, 0].set_ylabel("Runs")
 
     _draw_chi2_hist(axes[0, 1], chi2_vals, max_chi2, zoomed=False)
@@ -489,8 +491,8 @@ def plot_metric_distributions(
     zoomed_path = output_path.parent / f"{output_path.stem}_zoomed.png"
     fig_z, axes_z = plt.subplots(2, 2, figsize=(12, 10))
 
-    _draw_rms_hist(axes_z[0, 0], rms_vals, max_rms_pct, zoomed=True)
-    axes_z[0, 0].set_xlabel(rf"{subdet} RMS Non-Flatness [%]")
+    _draw_rms_hist(axes_z[0, 0], rms_vals, rms_cut, zoomed=True)
+    axes_z[0, 0].set_xlabel(rf"{subdet} RMS / Poisson Expectation")
     axes_z[0, 0].set_ylabel("Runs")
 
     _draw_chi2_hist(axes_z[0, 1], chi2_vals, max_chi2, zoomed=True)
@@ -515,16 +517,16 @@ def plot_metric_distributions(
 
         # RMS
         fig_r, ax_r = plt.subplots(figsize=(8.5, 6.5))
-        _draw_rms_hist(ax_r, rms_vals, max_rms_pct, zoomed=False, title_font=10.0)
-        ax_r.set_xlabel(rf"{subdet} RMS Non-Flatness [%]", fontsize=14)
+        _draw_rms_hist(ax_r, rms_vals, rms_cut, zoomed=False, title_font=10.0)
+        ax_r.set_xlabel(rf"{subdet} RMS / Poisson Expectation", fontsize=14)
         ax_r.set_ylabel("Runs", fontsize=14)
         fig_r.tight_layout()
         fig_r.savefig(parent / f"rms_distribution_{subdet}.png", dpi=300, bbox_inches="tight")
         plt.close(fig_r)
 
         fig_rz, ax_rz = plt.subplots(figsize=(8.5, 6.5))
-        _draw_rms_hist(ax_rz, rms_vals, max_rms_pct, zoomed=True, title_font=10.0)
-        ax_rz.set_xlabel(rf"{subdet} RMS Non-Flatness [%]", fontsize=14)
+        _draw_rms_hist(ax_rz, rms_vals, rms_cut, zoomed=True, title_font=10.0)
+        ax_rz.set_xlabel(rf"{subdet} RMS / Poisson Expectation", fontsize=14)
         ax_rz.set_ylabel("Runs", fontsize=14)
         fig_rz.tight_layout()
         fig_rz.savefig(parent / f"rms_distribution_{subdet}_zoomed.png", dpi=300, bbox_inches="tight")
@@ -578,15 +580,17 @@ def plot_metric_comparison_1x3(
     data_list: Sequence[Dict[str, Any]],
     output_path: Union[str, Path],
     metric_type: str = "rms",
-    max_rms_pct: float = 3.5,
+    rms_cut: float = 3.5,
     max_chi2: float = 2.0,
     max_a: float = 1.0,
     min_events: float = 100000.0,
     zoomed: bool = False,
+    max_a_ns: Optional[float] = None,
 ) -> None:
     """
     Generate a 1x3 comparison plot displaying the same metric for South (S),
     North (N), and North+South combined (NS) side by side with consistent axes.
+    max_a is the A1/A2 cut drawn for the arms; max_a_ns (default: max_a) for NS.
     """
     _apply_hep_style()
     output_path = Path(output_path)
@@ -599,20 +603,20 @@ def plot_metric_comparison_1x3(
 
     if metric_type == "rms":
         all_vals = [
-            [m.get("rms_pct", np.nan) for m in [_get_subdet_metric(d, s) for d in data_list] if not np.isnan(m.get("rms_pct", np.nan))]
+            [m.get("rms_sigma", np.nan) for m in [_get_subdet_metric(d, s) for d in data_list] if not np.isnan(m.get("rms_sigma", np.nan))]
             for s in subdets
         ]
         valid_max = [max(v) for v in all_vals if len(v)]
-        max_seen = max(valid_max) if valid_max else max_rms_pct
+        max_seen = max(valid_max) if valid_max else rms_cut
         if zoomed:
             x_max = 2.0
         else:
-            x_max = max(max_rms_pct * 1.05, max_seen * 1.05)
+            x_max = max(rms_cut * 1.05, max_seen * 1.05)
 
         for i, sdet in enumerate(subdets):
-            _draw_rms_hist(axes[i], all_vals[i], max_rms_pct, zoomed=zoomed)
+            _draw_rms_hist(axes[i], all_vals[i], rms_cut, zoomed=zoomed)
             axes[i].set_title(subdet_titles[i], fontsize=14, fontweight="bold")
-            axes[i].set_xlabel(rf"{sdet} RMS Non-Flatness [%]", fontsize=13)
+            axes[i].set_xlabel(rf"{sdet} RMS / Poisson Expectation", fontsize=13)
             axes[i].set_xlim(0, x_max)
             if i == 0:
                 axes[i].set_ylabel("Runs", fontsize=14)
@@ -656,7 +660,8 @@ def plot_metric_comparison_1x3(
             x_max = max(max_a * 1.08, max_seen * 1.08)
 
         for i, sdet in enumerate(subdets):
-            _draw_modulations_hist(axes[i], all_a1[i], all_a2[i], max_a, zoomed=zoomed)
+            cut = max_a_ns if (sdet == "NS" and max_a_ns is not None) else max_a
+            _draw_modulations_hist(axes[i], all_a1[i], all_a2[i], cut, zoomed=zoomed)
             axes[i].set_title(subdet_titles[i], fontsize=14, fontweight="bold")
             axes[i].set_xlabel(rf"{sdet} Harmonic Modulation Amplitude [%]", fontsize=13)
             axes[i].set_xlim(0, x_max)
@@ -819,9 +824,9 @@ def plot_diagnostic_run(
         info_txt = (
             rf"Run {run_number} [{sdet}]" + "\n" +
             rf"Events: {m['total_events']:,.0f}" + "\n" +
-            rf"$\chi^2/\mathrm{{ndf}}$: {m['chi2_ndf']:.2f}, MaxDev: {m.get('max_dev_pct', 0.0):.1f}%" + "\n" +
-            rf"RMS: {m['rms_pct']:.2f}% (excess: {m['rms_excess_pct']:.2f}%)" + "\n" +
-            rf"$A_1$: {m['A1_pct']:.2f}%, $A_2$: {m['A2_pct']:.2f}%" + "\n" +
+            rf"$\chi^2/\mathrm{{ndf}}$: {m['chi2_ndf']:.2f}, MaxDev: {m.get('max_dev_pct', 0.0):.1f}% ({m.get('max_dev_sigma', np.nan):.1f}$\sigma$)" + "\n" +
+            rf"RMS: {m['rms_pct']:.2f}% = {m.get('rms_sigma', np.nan):.2f}$\times$Poisson (excess: {m['rms_excess_pct']:.2f}%)" + "\n" +
+            rf"$A_1$: {m['A1_pct']:.2f}% ({m.get('A1_sig', np.nan):.1f}$\sigma$), $A_2$: {m['A2_pct']:.2f}% ({m.get('A2_sig', np.nan):.1f}$\sigma$)" + "\n" +
             rf"Status: {m['status']}"
         )
         ax_top.text(
@@ -904,7 +909,7 @@ def plot_failure_mode_metric_distribution(
     example_runs: Sequence[int],
     output_path: Union[str, Path],
     subdet: str = "NS",
-    max_rms_pct: float = 3.5,
+    rms_cut: float = 3.5,
     max_chi2: float = 2.0,
     max_a: float = 1.0,
 ) -> None:
@@ -931,7 +936,7 @@ def plot_failure_mode_metric_distribution(
         vals = [max(m.get("A1_pct", 0), m.get("A2_pct", 0)) for m in m_list]
         x_max = max(max_a * 1.08, max(vals) * 1.08) if vals else max_a * 1.1
         ax.hist(vals, bins=np.linspace(0, x_max, 45), histtype="step", color="mediumvioletred", linewidth=2.0)
-        ax.axvline(max_a, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({max_a:.1f}%)")
+        ax.axvline(max_a, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({max_a:g}%)")
         ax.set_xlim(0, x_max)
         ax.set_xlabel(rf"{subdet} Peak Harmonic Amplitude $\max(A_1, A_2)$ [%]")
         val_key = "max_A"
@@ -946,13 +951,13 @@ def plot_failure_mode_metric_distribution(
         ax.set_xlabel("Total Events")
         val_key = "total_events"
     else:  # NON_FLAT or generic
-        vals = [m.get("rms_pct", np.nan) for m in m_list if not np.isnan(m.get("rms_pct", np.nan))]
-        x_max = max(max_rms_pct * 1.05, max(vals) * 1.05) if vals else max_rms_pct * 1.1
+        vals = [m.get("rms_sigma", np.nan) for m in m_list if not np.isnan(m.get("rms_sigma", np.nan))]
+        x_max = max(rms_cut * 1.05, max(vals) * 1.05) if vals else rms_cut * 1.1
         ax.hist(vals, bins=np.linspace(0, x_max, 45), histtype="step", color="steelblue", linewidth=2.0)
-        ax.axvline(max_rms_pct, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({max_rms_pct:.1f}%)")
+        ax.axvline(rms_cut, color="crimson", linestyle="--", linewidth=2, label=rf"Cut ({rms_cut:g})")
         ax.set_xlim(0, x_max)
-        ax.set_xlabel(rf"{subdet} RMS Non-Flatness [%]")
-        val_key = "rms_pct"
+        ax.set_xlabel(rf"{subdet} RMS / Poisson Expectation")
+        val_key = "rms_sigma"
 
     # Mark the example runs with vertical lines
     run_dict = {d["run_number"]: _get_subdet_metric(d, subdet) for d in metrics_list}
@@ -1198,3 +1203,66 @@ def plot_components_trends(
     fig_flat.savefig(output_dir / "trends_components_flattening.png", dpi=300, bbox_inches="tight")
     plt.close(fig_flat)
 
+
+
+# ==============================================================================
+# 8. CENTRALITY-SLICE SUMMARY
+# ==============================================================================
+
+def plot_slice_summary(
+    data_list: Sequence[Dict[str, Any]],
+    output_path: Union[str, Path],
+    slice_labels: Sequence[str],
+    cuts: Dict[str, float],
+) -> None:
+    """
+    Grid of flatness metrics vs run number: one row per centrality slice, columns chi2/ndf,
+    RMS / Poisson expectation, A1 and A2, with N, S and NS overlaid. Only runs whose integrated
+    (NS) status is GOOD are shown, so slice-only problems stand out.
+    """
+    _apply_hep_style()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    good = [d for d in data_list if d.get("primary_status") == "GOOD" and d.get("slices")]
+    columns = [
+        ("chi2_ndf", r"$\chi^2/\mathrm{ndf}$ vs flat", cuts["max_chi2"], None),
+        ("rms_sigma", "RMS / Poisson exp.", cuts["max_rms_sigma"], None),
+        ("A1_pct", r"$A_1$ [%]", cuts["max_a_arm"], cuts["max_a_ns"]),
+        ("A2_pct", r"$A_2$ [%]", cuts["max_a_arm"], cuts["max_a_ns"]),
+    ]
+    arms = [("S", "crimson", "South (S)"), ("N", "royalblue", "North (N)"), ("NS", "black", "Combined (NS)")]
+
+    fig, axes = plt.subplots(len(slice_labels), len(columns), figsize=(5.2 * len(columns), 3.2 * len(slice_labels)),
+                             sharex=True, squeeze=False)
+    runs = np.array([d["run_number"] for d in good])
+
+    for i, label in enumerate(slice_labels):
+        for j, (key, title, cut_arm, cut_ns) in enumerate(columns):
+            ax = axes[i, j]
+            ymax = 0.0
+            for sdet, color, arm_label in arms:
+                vals = np.array([d["slices"].get(label, {}).get(sdet, {}).get(key, np.nan) for d in good], dtype=float)
+                ax.scatter(runs, vals, s=4, color=color, alpha=0.45, edgecolors="none",
+                           label=arm_label if (i == 0 and j == 0) else None)
+                if np.isfinite(vals).any():
+                    ymax = max(ymax, float(np.nanpercentile(vals, 99.8)))
+            ax.axhline(cut_arm, color="darkorange", linestyle="--", linewidth=1.3,
+                       label=(f"Cut{' (arms)' if cut_ns is not None else ''}" if i == 0 else None))
+            if cut_ns is not None:
+                ax.axhline(cut_ns, color="black", linestyle=":", linewidth=1.3, label="Cut (NS)" if i == 0 else None)
+            ax.set_ylim(0, max(ymax, cut_arm) * 1.25)
+            ax.grid(True, linestyle="--", alpha=0.3)
+            if i == 0:
+                ax.set_title(title, fontsize=13)
+            if j == 0:
+                ax.set_ylabel(f"{label}%", fontsize=13)
+            if i == len(slice_labels) - 1:
+                ax.set_xlabel("Run Number", fontsize=12)
+            if i == 0:
+                ax.legend(loc="upper left", fontsize=8.5, markerscale=3, frameon=True, framealpha=0.9)
+
+    fig.suptitle("Flatness by centrality slice (runs GOOD integrated over centrality)", fontsize=15)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)

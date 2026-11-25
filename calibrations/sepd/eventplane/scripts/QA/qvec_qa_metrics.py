@@ -126,15 +126,19 @@ def compute_psi_flatness_metrics(
             "total_events": 0.0,
             "mean_bin": 0.0,
             "rms_pct": np.nan,
+            "rms_sigma": np.nan,
             "rms_excess_pct": np.nan,
             "max_dev_pct": np.nan,
+            "max_dev_sigma": np.nan,
             "chi2_ndf": np.nan,
             "a1": np.nan,
             "b1": np.nan,
             "A1_pct": np.nan,
+            "A1_sig": np.nan,
             "a2": np.nan,
             "b2": np.nan,
             "A2_pct": np.nan,
+            "A2_sig": np.nan,
             "values": values,
             "ratios": np.zeros(n_bins),
             "bin_centers": bin_centers,
@@ -178,19 +182,33 @@ def compute_psi_flatness_metrics(
     b2 = float(2.0 * np.sum(values * np.sin(2.0 * bin_centers)) / total_events)
     A2_pct = float(np.sqrt(a2 ** 2 + b2 ** 2)) * 100.0
 
+    # 6. Statistics-aware versions, in units of the Poisson expectation for a flat distribution:
+    # - rms_sigma: RMS relative deviation / (1/sqrt(mean_bin)); ~1 for a statistically flat distribution
+    # - max_dev_sigma: largest single-bin deviation in Poisson sigma of that bin
+    # - A_n_sig: A_n / sigma(A_n), with sigma(a_n) = sigma(b_n) = sqrt(2/N) for a flat distribution
+    rms_sigma = float(np.sqrt(tot_var * mean_bin))
+    max_dev_sigma = float(np.max(np.abs(dev)) * np.sqrt(mean_bin))
+    sigma_a = float(np.sqrt(2.0 / total_events)) * 100.0
+    A1_sig = A1_pct / sigma_a
+    A2_sig = A2_pct / sigma_a
+
     return {
         "total_events": total_events,
         "mean_bin": mean_bin,
         "rms_pct": rms_pct,
+        "rms_sigma": rms_sigma,
         "rms_excess_pct": rms_excess_pct,
         "max_dev_pct": max_dev_pct,
+        "max_dev_sigma": max_dev_sigma,
         "chi2_ndf": chi2_ndf,
         "a1": a1,
         "b1": b1,
         "A1_pct": A1_pct,
+        "A1_sig": A1_sig,
         "a2": a2,
         "b2": b2,
         "A2_pct": A2_pct,
+        "A2_sig": A2_sig,
         "values": values,
         "ratios": ratios,
         "bin_centers": bin_centers,
@@ -198,39 +216,175 @@ def compute_psi_flatness_metrics(
     }
 
 
-def evaluate_subdet_status(
-    m: Dict[str, Any],
-    min_events: float = 100000.0,
-    max_chi2: float = 2.0,
-    max_rms: float = 3.5,
-    max_excess_rms: float = 2.0,
-    max_dev_pct: float = 12.0,
-    max_a1: float = 1.0,
-    max_a2: float = 1.0,
-) -> str:
+# ------------------------------------------------------------------------------
+# QA cuts
+# ------------------------------------------------------------------------------
+
+# Default cuts. Statistics-dependent quantities are judged in Poisson sigma, and a flag needs
+# both statistical significance and a size that matters, so low-statistics runs are not flagged
+# for fluctuations and high-statistics runs are not flagged for tiny, real residuals.
+DEFAULT_CUTS: Dict[str, float] = {
+    "min_events": 100000.0,  # events per run (LOW_STATS)
+    "max_chi2": 2.0,         # chi2/ndf vs flat, with 1% systematic floor per bin (HIGH_CHI2)
+    "max_rms_sigma": 1.3,    # RMS deviation / Poisson expectation; NON_FLAT needs this AND max_excess_rms
+    "max_excess_rms": 2.0,   # statistics-subtracted RMS [%]
+    "max_dev_sigma": 6.0,    # largest single-bin deviation [Poisson sigma] (NON_FLAT)
+    "max_a_ns": 0.75,        # A1/A2 [%] for NS; RESIDUAL_MODULATION needs this AND min_a_sig
+    "max_a_arm": 1.0,        # A1/A2 [%] for N and S
+    "min_a_sig": 4.0,        # A1/A2 significance [sigma of a flat distribution]
+    "max_recent_dev": 1e-3,  # max |<Qx>|, |<Qy>| after recentering (N, S)
+    "max_twist_dev": 1e-3,   # max |<Qxy>| after flattening (N, S, NS)
+    "max_ratio_dev": 0.02,   # max |<Qxx>/<Qyy> - 1| after flattening (N, S, NS)
+}
+
+# Default centrality slices [%] evaluated in addition to the integrated distribution.
+DEFAULT_CENT_SLICES: Tuple[Tuple[float, float], ...] = ((0, 20), (20, 40), (40, 60), (60, 80))
+
+
+def add_cut_args(parser) -> None:
+    """Adds the QA cut options (defaults from DEFAULT_CUTS) to an argparse parser."""
+    c = DEFAULT_CUTS
+    parser.add_argument("--min-events", type=float, default=c["min_events"],
+                        help=f"Minimum events per run (default: {c['min_events']:,.0f}).")
+    parser.add_argument("--max-chi2", type=float, default=c["max_chi2"],
+                        help=f"Maximum chi2/ndf vs flat, with a 1%% systematic floor per bin (default: {c['max_chi2']:g}).")
+    parser.add_argument("--max-rms-sigma", type=float, default=c["max_rms_sigma"],
+                        help=f"RMS deviation in units of the Poisson expectation above which a run can be NON_FLAT; "
+                             f"it must also exceed --max-excess-rms (default: {c['max_rms_sigma']:g}).")
+    parser.add_argument("--max-excess-rms", type=float, default=c["max_excess_rms"],
+                        help=f"Statistics-subtracted RMS [%%] above which a run can be NON_FLAT; "
+                             f"it must also exceed --max-rms-sigma (default: {c['max_excess_rms']:g}%%).")
+    parser.add_argument("--max-dev-sigma", type=float, default=c["max_dev_sigma"],
+                        help=f"Largest single-bin deviation [Poisson sigma] for NON_FLAT (default: {c['max_dev_sigma']:g}).")
+    parser.add_argument("--max-a", dest="max_a_ns", type=float, default=c["max_a_ns"],
+                        help=f"Maximum A1/A2 [%%] for the combined NS distribution (default: {c['max_a_ns']:g}%%).")
+    parser.add_argument("--max-a-arm", type=float, default=c["max_a_arm"],
+                        help=f"Maximum A1/A2 [%%] for the N and S arms (default: {c['max_a_arm']:g}%%).")
+    parser.add_argument("--min-a-sig", type=float, default=c["min_a_sig"],
+                        help=f"Minimum A1/A2 significance [sigma] for RESIDUAL_MODULATION (default: {c['min_a_sig']:g}).")
+    parser.add_argument("--max-recent-dev", type=float, default=c["max_recent_dev"],
+                        help=f"Maximum |<Qx>|, |<Qy>| after recentering (default: {c['max_recent_dev']:g}).")
+    parser.add_argument("--max-twist-dev", type=float, default=c["max_twist_dev"],
+                        help=f"Maximum |<Qxy>| after flattening (default: {c['max_twist_dev']:g}).")
+    parser.add_argument("--max-ratio-dev", type=float, default=c["max_ratio_dev"],
+                        help=f"Maximum |<Qxx>/<Qyy> - 1| after flattening (default: {c['max_ratio_dev']:g}).")
+
+
+def cuts_from_args(args) -> Dict[str, float]:
+    """Builds the cuts dictionary from parsed add_cut_args() options."""
+    return {k: getattr(args, k) for k in DEFAULT_CUTS}
+
+
+def parse_cent_slices(text: str) -> Tuple[Tuple[float, float], ...]:
+    """Parses '0-20,20-40' into ((0, 20), (20, 40)); 'none' or '' gives no slices."""
+    if not text or text.strip().lower() == "none":
+        return ()
+    slices = []
+    for part in text.split(","):
+        lo, hi = part.strip().split("-")
+        slices.append((float(lo), float(hi)))
+    return tuple(slices)
+
+
+def slice_label(cent_slice: Tuple[float, float]) -> str:
+    return f"{cent_slice[0]:g}-{cent_slice[1]:g}"
+
+
+def ensure_derived_metrics(m: Dict[str, Any]) -> None:
+    """Adds metrics introduced later (e.g. rms_sigma) to records from older caches, using the stored histogram."""
+    if "rms_sigma" in m:
+        return
+    values, edges = m.get("values"), m.get("edges")
+    if values is not None and edges is not None and len(values) > 1:
+        m.update({k: v for k, v in compute_psi_flatness_metrics(values, edges).items()
+                  if k in ("rms_sigma", "max_dev_sigma", "A1_sig", "A2_sig")})
+    else:
+        m.update({"rms_sigma": np.nan, "max_dev_sigma": np.nan, "A1_sig": np.nan, "A2_sig": np.nan})
+
+
+def _gt(value: float, cut: float) -> bool:
+    return value is not None and not np.isnan(value) and value > cut
+
+
+def evaluate_subdet_status(m: Dict[str, Any], cuts: Dict[str, float], subdet: str = "NS") -> str:
     """
-    Evaluate QA pass/fail status flags for a single subdetector metric dictionary.
+    Evaluates the QA flags of one subdetector's flatness metrics:
+    - FLAG_EMPTY_OR_ZERO: no events
+    - FLAG_LOW_STATS: fewer than min_events
+    - FLAG_HIGH_CHI2: chi2/ndf vs flat above max_chi2
+    - FLAG_NON_FLAT: RMS both significant (rms_sigma > max_rms_sigma) and large (excess RMS > max_excess_rms),
+      or a single bin more than max_dev_sigma Poisson sigma from flat
+    - FLAG_RESIDUAL_MODULATION: A1 or A2 above the cut (max_a_ns for NS, max_a_arm for N/S)
+      and more significant than min_a_sig
     """
-    if m["total_events"] <= 0 or np.isnan(m["rms_pct"]):
+    if m.get("total_events", 0) <= 0 or np.isnan(m.get("rms_pct", np.nan)):
         return "FLAG_EMPTY_OR_ZERO"
+    ensure_derived_metrics(m)
 
     flags = []
-    if m["total_events"] < min_events:
+    if m["total_events"] < cuts["min_events"]:
         flags.append("FLAG_LOW_STATS")
 
-    if not np.isnan(m["chi2_ndf"]) and m["chi2_ndf"] > max_chi2:
+    if _gt(m["chi2_ndf"], cuts["max_chi2"]):
         flags.append("FLAG_HIGH_CHI2")
 
-    if (not np.isnan(m["rms_excess_pct"]) and m["rms_excess_pct"] > max_excess_rms) or \
-       (not np.isnan(m["rms_pct"]) and m["rms_pct"] > max_rms and not np.isnan(m["chi2_ndf"]) and m["chi2_ndf"] > max_chi2) or \
-       (not np.isnan(m["max_dev_pct"]) and m["max_dev_pct"] > max_dev_pct):
+    rms_flag = _gt(m["rms_sigma"], cuts["max_rms_sigma"]) and _gt(m["rms_excess_pct"], cuts["max_excess_rms"])
+    if rms_flag or _gt(m["max_dev_sigma"], cuts["max_dev_sigma"]):
         flags.append("FLAG_NON_FLAT")
 
-    if (not np.isnan(m["A1_pct"]) and m["A1_pct"] > max_a1) or \
-       (not np.isnan(m["A2_pct"]) and m["A2_pct"] > max_a2):
+    max_a = cuts["max_a_ns"] if subdet == "NS" else cuts["max_a_arm"]
+    if any(_gt(m[f"A{n}_pct"], max_a) and _gt(m[f"A{n}_sig"], cuts["min_a_sig"]) for n in (1, 2)):
         flags.append("FLAG_RESIDUAL_MODULATION")
 
     return ";".join(flags) if flags else "GOOD"
+
+
+def _component_flags(record: Dict[str, Any], cuts: Dict[str, float]) -> List[str]:
+    """Recentering / twist / variance-ratio flags from the component scalars of a run record."""
+    flags = []
+    for sdet in ("N", "S"):
+        if _gt(record.get(f"Q_{sdet}_x_max_abs", np.nan), cuts["max_recent_dev"]) or \
+           _gt(record.get(f"Q_{sdet}_y_max_abs", np.nan), cuts["max_recent_dev"]):
+            flags.append(f"FLAG_RECENT_NONZERO_{sdet}")
+    for sdet in ("N", "S", "NS"):
+        if _gt(record.get(f"Q_{sdet}_xy_max_abs", np.nan), cuts["max_twist_dev"]):
+            flags.append(f"FLAG_TWIST_NONZERO_{sdet}")
+        if _gt(record.get(f"Q_{sdet}_xxyy_max_dev", np.nan), cuts["max_ratio_dev"]):
+            flags.append(f"FLAG_FLAT_ECCENTRICITY_{sdet}")
+    return flags
+
+
+def evaluate_run(record: Dict[str, Any], cuts: Dict[str, float]) -> None:
+    """
+    Sets all statuses of a run record from its metrics:
+    - per subdetector (integrated over centrality): sm["status"]
+    - record["primary_status"]: the NS status; decides good / flagged runs
+    - record["status"]: all integrated and component flags, as FLAG_<name>_<subdet>
+    - per centrality slice: record["slices"][label][subdet]["status"], and record["slice_status"] listing
+      slice flags as FLAG_<name>_<subdet>@<slice>. Slice flags are reported only and do not change the
+      primary status. FLAG_LOW_STATS is not listed for slices, since a slice holds only part of a run's
+      events; the other flags are statistics-aware and are listed as usual.
+    """
+    subdets = record.get("subdetectors", {})
+    all_flags: List[str] = []
+    for sdet, sm in subdets.items():
+        sm["status"] = evaluate_subdet_status(sm, cuts, sdet)
+        if sm["status"] != "GOOD":
+            all_flags.extend(f"{f}_{sdet}" for f in sm["status"].split(";") if f"{f}_{sdet}" not in all_flags)
+    all_flags.extend(f for f in _component_flags(record, cuts) if f not in all_flags)
+
+    record["primary_status"] = subdets["NS"]["status"] if "NS" in subdets else next(iter(subdets.values()), {}).get("status", "UNKNOWN")
+    record["status"] = ";".join(all_flags) if all_flags else "GOOD"
+    if "NS" in subdets:
+        record["total_events"] = subdets["NS"].get("total_events", record.get("total_events", 0.0))
+
+    slice_flags: List[str] = []
+    for label, slice_subdets in record.get("slices", {}).items():
+        for sdet, sm in slice_subdets.items():
+            sm["status"] = evaluate_subdet_status(sm, cuts, sdet)
+            slice_flags.extend(f"{f}_{sdet}@{label}" for f in sm["status"].split(";")
+                               if f not in ("GOOD", "FLAG_LOW_STATS", "FLAG_EMPTY_OR_ZERO"))
+    record["slice_status"] = ";".join(slice_flags) if slice_flags else "GOOD"
 
 def extract_qvec_component_metrics(
     f: uproot.ReadOnlyDirectory,
@@ -385,22 +539,19 @@ def extract_qvec_run_metrics(
     pass_suffix: str = "_corr2",
     cent_min: Optional[float] = None,
     cent_max: Optional[float] = None,
-    min_events: float = 100000.0,
-    max_chi2: float = 2.0,
-    max_rms: float = 3.5,
-    max_excess_rms: float = 2.0,
-    max_dev_pct: float = 12.0,
-    max_a1: float = 1.0,
-    max_a2: float = 1.0,
+    cent_slices: Sequence[Tuple[float, float]] = (),
     syst_floor: float = 0.01,
     check_components: bool = True,
-    max_recent_dev: float = 1e-3,
-    max_twist_dev: float = 1e-3,
-    max_ratio_dev: float = 0.02,
+    cuts: Optional[Dict[str, float]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Fast extraction of scalar flatness, harmonic, and intermediate Q-vector
     QA metrics from a single ROOT file for all specified subdetectors.
+
+    The Psi distribution is projected over [cent_min, cent_max] (default: all centralities) and,
+    separately, over each centrality slice in cent_slices (half-open [low, high) on bin centres),
+    stored in record["slices"][label][subdet]. Statuses are set by evaluate_run() with the given
+    cuts (DEFAULT_CUTS if None).
 
     Returns:
         tuple: (metric_dict, error_message)
@@ -415,13 +566,13 @@ def extract_qvec_run_metrics(
 
     try:
         subdet_metrics = {}
-        subdet_statuses = {}
+        slices: Dict[str, Dict[str, Any]] = {slice_label(s): {} for s in cent_slices}
         comp_metrics = None
 
         with uproot.open(path) as f_root:
             for subdet in subdetectors:
                 hist_name = f"h2_sEPD_Psi_{subdet}_{harmonic}{pass_suffix}"
-                values, edges, bin_centers, total_events = get_qvec_psi_hist_data(
+                values, edges, _, _ = get_qvec_psi_hist_data(
                     f_root,
                     hist_name=hist_name,
                     cent_min=cent_min,
@@ -431,74 +582,43 @@ def extract_qvec_run_metrics(
                 if values is None:
                     # Histogram missing
                     m = compute_psi_flatness_metrics(np.array([]), np.array([]))
-                    m["hist_name"] = hist_name
-                    status = "FLAG_EMPTY_OR_ZERO"
                 else:
                     m = compute_psi_flatness_metrics(values, edges, syst_floor=syst_floor)
-                    m["hist_name"] = hist_name
-                    status = evaluate_subdet_status(
-                        m,
-                        min_events=min_events,
-                        max_chi2=max_chi2,
-                        max_rms=max_rms,
-                        max_excess_rms=max_excess_rms,
-                        max_dev_pct=max_dev_pct,
-                        max_a1=max_a1,
-                        max_a2=max_a2,
-                    )
-
-                m["status"] = status
+                m["hist_name"] = hist_name
                 subdet_metrics[subdet] = m
-                subdet_statuses[subdet] = status
 
-            # Intermediate Q-vector component checks (recentering, twisting, variance ratio)
+                if cent_slices:
+                    arr = f_root[hist_name].to_numpy() if hist_name in f_root else None
+                    for s in cent_slices:
+                        if arr is not None and len(arr) == 3:
+                            values_2d, edges_x, edges_y = arr
+                            x_centers = 0.5 * (edges_x[:-1] + edges_x[1:])
+                            mask = (x_centers >= s[0]) & (x_centers < s[1])
+                            sm = compute_psi_flatness_metrics(values_2d[mask, :].sum(axis=0), edges_y, syst_floor=syst_floor)
+                        else:
+                            sm = compute_psi_flatness_metrics(np.array([]), np.array([]))
+                        sm["hist_name"] = hist_name
+                        slices[slice_label(s)][subdet] = sm
+
+            # Intermediate Q-vector component checks (recentering, twisting, variance ratio);
+            # their flags are set by evaluate_run() from the scalars
             if check_components:
                 comp_metrics = extract_qvec_component_metrics(
                     f_root,
                     harmonic=harmonic,
                     subdetectors=subdetectors,
-                    max_recent_dev=max_recent_dev,
-                    max_twist_dev=max_twist_dev,
-                    max_ratio_dev=max_ratio_dev,
                 )
-
-        # Overall composite status:
-        # If NS is in subdetectors, primary status reflects NS, with arm-specific notes if N or S fail
-        if "NS" in subdet_statuses:
-            primary_status = subdet_statuses["NS"]
-        else:
-            # First available subdetector
-            primary_status = list(subdet_statuses.values())[0]
-
-        all_flags = []
-        for sdet, st in subdet_statuses.items():
-            if st != "GOOD":
-                for flag in st.split(";"):
-                    entry = f"{flag}_{sdet}" if len(subdetectors) > 1 else flag
-                    if entry not in all_flags:
-                        all_flags.append(entry)
-
-        # Incorporate component flags if any triggered
-        if comp_metrics:
-            for flag in comp_metrics.get("flags", []):
-                if flag not in all_flags:
-                    all_flags.append(flag)
-
-        overall_status = ";".join(all_flags) if all_flags else "GOOD"
-
-        # Primary total events (from NS if present, else first subdet)
-        primary_tot_events = subdet_metrics.get("NS", {}).get("total_events", 0.0)
 
         record: Dict[str, Any] = {
             "run_number": run_number,
             "file_path": str(path),
             "harmonic": harmonic,
             "pass_suffix": pass_suffix,
-            "total_events": primary_tot_events,
-            "status": overall_status,
-            "primary_status": primary_status,
+            "total_events": subdet_metrics.get("NS", {}).get("total_events", 0.0),
             "subdetectors": subdet_metrics,
         }
+        if cent_slices:
+            record["slices"] = slices
 
         if comp_metrics:
             record["components"] = comp_metrics
@@ -521,6 +641,7 @@ def extract_qvec_run_metrics(
                 "edges": ns_m["edges"],
             })
 
+        evaluate_run(record, cuts if cuts is not None else DEFAULT_CUTS)
         return record, None
 
     except Exception as e:
