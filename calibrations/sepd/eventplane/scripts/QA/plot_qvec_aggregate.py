@@ -305,9 +305,59 @@ def generate_top_flat_examples(
     return selected_run_numbers
 
 
+def explain_arm_flags(arm_label: str, sm: Dict[str, Any], cuts: Dict[str, float]) -> List[str]:
+    """
+    Explain each flag in one arm's status using that arm's own metrics and the cuts it was evaluated with.
+    """
+    flags = [f for f in sm.get("status", "GOOD").split(";") if f and f != "GOOD"]
+    if not flags:
+        return []
+
+    nevt = sm.get("total_events", 0.0)
+    mean_bin = sm.get("mean_bin", 0.0)
+    chi2 = sm.get("chi2_ndf", np.nan)
+    rms = sm.get("rms_pct", np.nan)
+    rms_ex = sm.get("rms_excess_pct", np.nan)
+    max_dev = sm.get("max_dev_pct", np.nan)
+    a1 = sm.get("A1_pct", np.nan)
+    a2 = sm.get("A2_pct", np.nan)
+    # Expected statistical fluctuation per Psi bin
+    poisson_pct = 100.0 / np.sqrt(mean_bin) if mean_bin > 0 else np.nan
+
+    reasons = []
+    for flag in flags:
+        if flag == "FLAG_EMPTY_OR_ZERO":
+            text = "no events or missing histogram"
+        elif flag == "FLAG_LOW_STATS":
+            text = f"{nevt:,.0f} events (cut: {cuts['min_events']:,.0f})"
+        elif flag == "FLAG_HIGH_CHI2":
+            text = f"chi2/ndf vs flat = {chi2:.2f} (cut: {cuts['max_chi2']:g})"
+        elif flag == "FLAG_NON_FLAT":
+            parts = []
+            if not np.isnan(rms_ex) and rms_ex > cuts["max_excess_rms"]:
+                parts.append(f"excess RMS {rms_ex:.2f}% (cut: {cuts['max_excess_rms']:g}%)")
+            if not np.isnan(rms) and rms > cuts["max_rms"] and not np.isnan(chi2) and chi2 > cuts["max_chi2"]:
+                parts.append(f"RMS {rms:.2f}% (cut: {cuts['max_rms']:g}%) with chi2/ndf {chi2:.2f}")
+            if not np.isnan(max_dev) and max_dev > cuts["max_dev_pct"]:
+                n_sigma = max_dev / poisson_pct if poisson_pct > 0 else np.nan
+                parts.append(
+                    f"max deviation {max_dev:.2f}% (cut: {cuts['max_dev_pct']:g}%), "
+                    f"{n_sigma:.1f} sigma of the ~{poisson_pct:.2f}%/bin Poisson fluctuation (~{mean_bin:,.0f} events/bin)"
+                )
+            text = "; ".join(parts) if parts else "non-flat"
+            text += f". chi2/ndf {chi2:.2f}, A2 {a2:.2f}%"
+        elif flag == "FLAG_RESIDUAL_MODULATION":
+            text = f"A1 {a1:.2f}%, A2 {a2:.2f}% (cut: {cuts['max_a']:g}%)"
+        else:
+            text = ""
+        reasons.append(f"**{arm_label}** `{flag}`" + (f": {text}" if text else ""))
+    return reasons
+
+
 def generate_flagged_arm_examples(
     metrics_list: Sequence[Dict[str, Any]],
     output_dir: Path,
+    cuts: Dict[str, float],
 ) -> List[int]:
     """
     Generate diagnostic plots for all runs that have any flagged detector arm status
@@ -349,28 +399,16 @@ def generate_flagged_arm_examples(
         n_s = subdets.get("N", {})
         s_s = subdets.get("S", {})
 
-        # Determine detailed explanation
+        # Explain each arm's flags with its own metrics
         reasons = []
-        if s_s.get("status") == "FLAG_NON_FLAT":
-            reasons.append(
-                f"**South Arm (S)** flagged `FLAG_NON_FLAT`: Max deviation reached {s_s.get('max_dev_pct', 0.0):.2f}% (cut: 12.0%). "
-                f"Run has low statistics ({s_s.get('total_events', 0):,.0f} total events, ~950 events/bin). "
-                f"Poisson uncertainty is 1/sqrt(950) ≈ 3.24%/bin, so a single 3.8-sigma Poisson fluctuation caused the max deviation to hit 12.56%. "
-                f"chi2/ndf is 1.11 (healthy) and residual modulation A2 is 0.45% (< 1.0%)."
-            )
-        elif s_s.get("status") == "FLAG_RESIDUAL_MODULATION":
-            reasons.append(
-                f"**South Arm (S)** flagged `FLAG_RESIDUAL_MODULATION`: Second harmonic Fourier amplitude A2 reached {s_s.get('A2_pct', 0.0):.2f}% (cut: 1.00%). "
-                f"Run has sufficient statistics ({s_s.get('total_events', 0):,.0f} events). A residual 1.14% modulation exists in South arm, "
-                f"which partially cancels with North to yield a flat combined NS distribution (A2 = 0.63% < 1.0%, status GOOD in NS)."
-            )
-        elif s_s.get("status") != "GOOD":
-            reasons.append(f"South Arm: {s_s.get('status')}")
+        for arm_label, sm in [("South Arm (S)", s_s), ("North Arm (N)", n_s), ("Combined (NS)", ns_s)]:
+            reasons.extend(explain_arm_flags(arm_label, sm, cuts))
 
-        if n_s.get("status") != "GOOD":
-            reasons.append(f"North Arm: {n_s.get('status')}")
-        if ns_s.get("status") != "GOOD":
-            reasons.append(f"Combined NS: {ns_s.get('status')}")
+        # A single arm flagged while the combined NS is GOOD usually means the arms' residuals cancel
+        if ns_s.get("status") == "GOOD" and (s_s.get("status") != "GOOD" or n_s.get("status") != "GOOD"):
+            reasons.append(
+                f"Combined NS is GOOD (chi2/ndf {ns_s.get('chi2_ndf', np.nan):.2f}, A2 {ns_s.get('A2_pct', np.nan):.2f}%)"
+            )
 
         for fl in status_overall.split(";"):
             if "FLAG_RECENT" in fl:
@@ -866,7 +904,18 @@ def main():
 
     # 7. Generate Flagged Arm Runs Diagnostics (dedicated folder for any runs with flagged detector arms)
     print(f"\nIdentifying runs with flagged detector arms and generating diagnostic plots...")
-    flagged_arm_runs = generate_flagged_arm_examples(data_list, output_dir)
+    flagged_arm_runs = generate_flagged_arm_examples(
+        data_list,
+        output_dir,
+        cuts={
+            "min_events": args.min_events,
+            "max_chi2": args.max_chi2,
+            "max_rms": args.max_rms,
+            "max_excess_rms": args.max_excess_rms,
+            "max_dev_pct": args.max_dev,
+            "max_a": args.max_a,
+        },
+    )
     print(f"  - Flagged arm runs saved in flagged_arm_runs/: {flagged_arm_runs}")
 
     # 8. Generate Failure Mode Galleries for primary subdetector (NS)
